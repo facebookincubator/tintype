@@ -54,11 +54,18 @@ jobs:
           submodules: recursive
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2
+        uses: pypa/cibuildwheel@v3.4.1
         env:
           CIBW_BUILD: "cp312-* cp313-*"
           CIBW_SKIP: "*-manylinux_i686 *-musllinux*"
           CIBW_ARCHS_MACOS: "x86_64 arm64"
+          # Install libzstd inside the manylinux container (mirrors ci.yml's
+          # `apt install libzstd-dev` but adapted for the CentOS-based image).
+          CIBW_BEFORE_ALL_LINUX: "yum install -y libzstd-devel"
+          # macOS: zstd is needed at build time. brew provides it for the
+          # runner's native arch; the x86_64 cross-compile leg may need
+          # additional work if the linker can't find an Intel build.
+          CIBW_BEFORE_ALL_MACOS: "brew install zstd"
 
       - name: Upload wheels artifact
         uses: actions/upload-artifact@v4
