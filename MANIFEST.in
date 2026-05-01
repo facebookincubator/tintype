@@ -1,0 +1,3 @@
+include snapshot_lib/*.h
+include snapshot_lib/*.cpp
+include _snapshot.cpp

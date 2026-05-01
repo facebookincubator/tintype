@@ -1,0 +1,58 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+[build-system]
+requires = ["setuptools>=64", "pybind11>=2.10", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tintype"
+version = "0.1.0"
+description = "High-performance Python exception snapshot library"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    {name = "Meta Platforms, Inc."},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: C++",
+    "Topic :: Software Development :: Debuggers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/facebookincubator/tintype"
+Issues = "https://github.com/facebookincubator/tintype/issues"
+Documentation = "https://github.com/facebookincubator/tintype/blob/main/PYTHON_API.md"
+
+# NOTE: Package/package_dir configuration is defined in setup.py.
+# The repo root IS the `tintype` package, so setuptools' auto-discovery
+# (via `[tool.setuptools.packages.find]`) cannot find it — there is no
+# `tintype/` subdirectory. setup.py sets the explicit package map instead.
+#
+# IMPORTANT: Do NOT create a `tests/__init__.py` in this source tree. The
+# repo root already has `__init__.py` (it IS the tintype package), so adding
+# `tests/__init__.py` would make pytest treat `./tests/` as a subpackage of
+# the source-tree `tintype` and import tests through the source tree.
+# That fails because the pybind11 extension `_snapshot.*.so` is only
+# installed into site-packages after `pip install .`, not in the source tree.
+# Without `tests/__init__.py` in source, `tintype.tests` is still correctly
+# installed in the wheel as a PEP 420 namespace package (`helpers.py` etc.
+# live under `site-packages/tintype/tests/`), so `from tintype.tests.helpers
+# import ...` resolves via the installed package.
+
+[tool.pytest.ini_options]
+# Defense-in-depth: use importlib mode so pytest never prepends the source
+# tree to sys.path. This matters if a developer does an editable install
+# (`pip install -e .`) and runs tests — without importlib mode, pytest can
+# shadow the installed package with the source tree.
+addopts = "--import-mode=importlib"
