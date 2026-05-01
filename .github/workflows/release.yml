@@ -1,0 +1,131 @@
+name: Release
+
+# Build platform-specific wheels + sdist and publish to (Test)PyPI.
+#
+# Publishing uses OIDC Trusted Publishing, so no API tokens are stored in
+# GitHub secrets. This requires one-time configuration on each index:
+#
+#   1. On https://pypi.org and https://test.pypi.org, go to the project's
+#      "Publishing" settings (or create a pending publisher if the project
+#      does not yet exist) and add a Trusted Publisher with:
+#        - Owner:              <github-org-or-user>
+#        - Repository name:    tintype
+#        - Workflow name:      release.yml
+#        - Environment name:   pypi     (for PyPI)
+#                              testpypi (for TestPyPI)
+#      See https://docs.pypi.org/trusted-publishers/ for details.
+#
+#   2. In this repo's GitHub settings, create two environments named
+#      "pypi" and "testpypi" (Settings -> Environments -> New environment).
+#      Optionally add required reviewers for the "pypi" environment so that
+#      production releases require manual approval.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same ref on tag pushes and manual runs,
+# but NOT on release: published events — we don't want to cancel a real
+# PyPI publish mid-flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+jobs:
+  build_wheels:
+    name: build_wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2
+        env:
+          CIBW_BUILD: "cp312-* cp313-*"
+          CIBW_SKIP: "*-manylinux_i686 *-musllinux*"
+          CIBW_ARCHS_MACOS: "x86_64 arm64"
+
+      - name: Upload wheels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cibw-wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    name: build_sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build sdist
+        run: pipx run build --sdist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cibw-sdist
+          path: dist/*.tar.gz
+
+  publish_testpypi:
+    name: publish_testpypi
+    needs: [build_wheels, build_sdist]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: testpypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cibw-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  publish_pypi:
+    name: publish_pypi
+    needs: [build_wheels, build_sdist]
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cibw-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
