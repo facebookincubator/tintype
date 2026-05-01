@@ -62,10 +62,33 @@ jobs:
           # Install libzstd inside the manylinux container (mirrors ci.yml's
           # `apt install libzstd-dev` but adapted for the CentOS-based image).
           CIBW_BEFORE_ALL_LINUX: "yum install -y libzstd-devel"
-          # macOS: zstd is needed at build time. brew provides it for the
-          # runner's native arch; the x86_64 cross-compile leg may need
-          # additional work if the linker can't find an Intel build.
-          CIBW_BEFORE_ALL_MACOS: "brew install zstd"
+          # macOS: the macos-latest runner (macOS 15+) ships Homebrew bottles
+          # targeting macOS 15, but cibuildwheel tags our wheel as macOS 11.
+          # delocate refuses to bundle a dylib with a higher min target than
+          # the wheel, so we build libzstd from source as a universal2 dylib
+          # targeting macOS 11.0. setup.py's find_zstd() searches
+          # /usr, /usr/local, /opt/homebrew in order, so /usr/local wins over
+          # any leftover Homebrew install.
+          CIBW_BEFORE_ALL_MACOS: |
+            brew uninstall --ignore-dependencies zstd 2>/dev/null || true
+            ZSTD_VERSION=1.5.6
+            curl -fL "https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/zstd-${ZSTD_VERSION}.tar.gz" | tar -xz -C /tmp
+            cmake -S "/tmp/zstd-${ZSTD_VERSION}/build/cmake" -B /tmp/zstd-build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+              -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+              -DZSTD_BUILD_SHARED=ON \
+              -DZSTD_BUILD_STATIC=OFF \
+              -DZSTD_BUILD_PROGRAMS=OFF \
+              -DZSTD_BUILD_TESTS=OFF \
+              -DCMAKE_INSTALL_PREFIX=/usr/local
+            cmake --build /tmp/zstd-build --parallel
+            sudo cmake --install /tmp/zstd-build
+          # Pin both x86_64 and arm64 legs to the same minimum macOS target
+          # that our vendored libzstd was built against (otherwise the x86_64
+          # default of 10.13 would be lower than the dylib's 11.0 and delocate
+          # would fail again).
+          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=11.0
 
       - name: Upload wheels artifact
         uses: actions/upload-artifact@v4
