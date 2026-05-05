@@ -15,9 +15,11 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <vector>
 
 namespace facebook::tintype::snapshot {
 
@@ -148,14 +150,22 @@ bool SnapshotReader::open(const std::string& path) {
       return false;
     }
 
-    // Create a temporary file for the decompressed data
-    tempFilePath_ = path + ".decompressed.tmp";
-    tempFd_ = ::open(tempFilePath_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    // Create a unique temporary file for the decompressed data.
+    // mkstemp guarantees a fresh path so concurrent readers of the same
+    // compressed source file (e.g., a sibling process attaching
+    // tintype_debug_launcher to the same .pytb) cannot collide on this temp
+    // file. With a shared name, one reader's O_TRUNC + ftruncate corrupts
+    // another reader's MAP_SHARED mmap (zero-fills the buffer through the
+    // shared inode) — see SnapshotWriter::open which already uses mkstemp
+    // for the same reason.
+    std::string tempTemplate = path + ".decompressed.XXXXXX";
+    tempFd_ = ::mkstemp(tempTemplate.data());
     if (tempFd_ < 0) {
-      lastError_ = "Failed to create temporary file: " + tempFilePath_ +
+      lastError_ = "Failed to create temporary file: " + tempTemplate +
           " (errno: " + std::to_string(errno) + ")";
       return false;
     }
+    tempFilePath_ = std::move(tempTemplate);
 
     // Extend the file to the decompressed size
     if (ftruncate(tempFd_, decompressedSize) < 0) {
