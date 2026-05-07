@@ -166,21 +166,29 @@ class SessionHandlerTest(unittest.TestCase):
         self._launch_with_snapshots([snap])
 
         messages = _drain_messages(self.stream)
-        # We expect: launch response, initialized, thread(s), stopped.
-        # We deliberately emit NO ``process`` event and NO ``description``
-        # on the stopped event — both surfaces (CALL STACK session row
-        # and thread row) ended up fighting for the same cell in ways
-        # VS Code wouldn't render consistently. The Tintype Snapshots
-        # sidebar group description is the single authoritative cursor
-        # surface.
+        # We expect: launch response, initialized, thread(s), two
+        # stopped events (bootstrap + real). The bootstrap carries a
+        # generic ``"Snapshot"`` description so VS Code has something to
+        # overwrite on its initial-launch race; the real event that
+        # follows sets the actual display name the user sees in the
+        # CALL STACK panel. We still emit NO ``process`` event — that
+        # surface is owned by the Tintype Snapshots sidebar.
         event_names = [m.get("event") for m in messages if m["type"] == "event"]
         self.assertIn("initialized", event_names)
         self.assertNotIn("process", event_names)
         self.assertIn("thread", event_names)
-        self.assertIn("stopped", event_names)
+        self.assertEqual(event_names.count("stopped"), 2)
 
-        stopped_event = next(m for m in messages if m.get("event") == "stopped")
-        self.assertNotIn("description", stopped_event["body"])
+        stopped_events = [m for m in messages if m.get("event") == "stopped"]
+        # First is bootstrap — generic "Snapshot" label.
+        self.assertEqual(stopped_events[0]["body"]["description"], "Snapshot")
+        # Second is the real one — must include a richer description.
+        self.assertIn("description", stopped_events[1]["body"])
+        self.assertIn("Snapshot", stopped_events[1]["body"]["description"])
+        self.assertNotEqual(
+            stopped_events[0]["body"]["description"],
+            stopped_events[1]["body"]["description"],
+        )
 
     def test_launch_fails_on_empty_snapshot_file(self) -> None:
         reader = MagicMock()
@@ -669,6 +677,30 @@ class SessionHandlerTest(unittest.TestCase):
         self.assertFalse(resp["success"])
         self.assertIn("int", resp.get("message", ""))
 
+    def test_tintype_jump_rejects_bool_index(self) -> None:
+        """``bool`` is a subclass of ``int`` in Python, so a bare
+        ``isinstance(raw_index, int)`` check would happily accept
+        ``True`` / ``False`` as indices 1 / 0. The handler explicitly
+        rejects bools first; cover both values so a refactor that
+        drops the ``isinstance(raw_index, bool)`` guard doesn't silently
+        re-introduce the issue."""
+        self._first_two_snapshot_launch()
+        for seq_num, bad_index in ((410, True), (411, False)):
+            with self.subTest(index=bad_index):
+                self.stream.seek(0)
+                self.stream.truncate()
+                _send_request(
+                    self.session,
+                    self.dispatcher,
+                    seq=seq_num,
+                    command="tintypeJumpToSnapshot",
+                    arguments={"index": bad_index},
+                )
+                resp = _drain_messages(self.stream)[0]
+                self.assertFalse(resp["success"])
+                self.assertIn("int", resp.get("message", ""))
+                self.assertIn("bool", resp.get("message", ""))
+
     def test_attach_routes_through_launch_handler(self) -> None:
         """An ``attach`` request should run the full launch flow.
 
@@ -763,15 +795,18 @@ class SessionHandlerTest(unittest.TestCase):
         # emit one.
         self.assertNotIn("process", event_names)
 
-        # Stopped event must NOT carry a ``description`` field (would
-        # leak into the CALL STACK session row and get stuck there).
+        # Stopped event now carries the snapshot ``description``. Unlike
+        # launch, restart only emits a single stopped event (no bootstrap)
+        # — the VS Code race is an initial-launch quirk, so subsequent
+        # stops take effect on the first try.
         stopped_events = [
             m
             for m in messages
             if m.get("type") == "event" and m.get("event") == "stopped"
         ]
         self.assertEqual(len(stopped_events), 1)
-        self.assertNotIn("description", stopped_events[0]["body"])
+        self.assertIn("description", stopped_events[0]["body"])
+        self.assertIn("Snapshot", stopped_events[0]["body"]["description"])
 
         # The cursor must now be back on snapshot #0.
         self.assertEqual(self.session._snapshot_index, 0)
@@ -1372,6 +1407,117 @@ class SessionHandlerTest(unittest.TestCase):
             for f in _drain_messages(self.stream)[0]["body"]["stackFrames"]
         ]
         self.assertEqual(hints, ["normal", "normal"])
+
+
+class StoppedEventDescriptionTest(unittest.TestCase):
+    """``stopped`` events carry a ``description`` field with the snapshot's
+    display name. On launch we send a bootstrap ``"Snapshot"`` event first so
+    VS Code has something to overwrite on its initial-launch race, followed
+    by the real description event the user actually sees."""
+
+    def setUp(self) -> None:
+        self.stream = RecordingStream()
+        self.dispatcher = Dispatcher(self.stream)
+        self.session = SnapshotDebugSession(self.dispatcher)
+        self.session.wire()
+
+    def _launch_with_snapshots(self, snapshots: list[Any]) -> MagicMock:
+        reader = MagicMock()
+        reader.snapshot_count.return_value = len(snapshots)
+        reader.get_all_source_files.return_value = []
+        reader.get_all_snapshots.return_value = snapshots
+        reader.get_snapshot_at_index.side_effect = (
+            lambda i: snapshots[i] if 0 <= i < len(snapshots) else None
+        )
+        with (
+            patch("tintype.dap.session.SnapshotReader", return_value=reader),
+            patch("tintype.dap.session.os.path.isfile", return_value=True),
+        ):
+            _send_request(
+                self.session,
+                self.dispatcher,
+                seq=1,
+                command="launch",
+                arguments={"pytbPath": "/fake/snap.pytb"},
+            )
+        return reader
+
+    def test_launch_description_includes_timestamp_and_index(self) -> None:
+        st = _make_stacktrace(
+            100, [_make_frame("/a/b.py", "foo", 1, {})], thread_name="MainThread"
+        )
+        snap = _make_snapshot([st], ts=1_700_000_000_000_000)
+        self._launch_with_snapshots([snap])
+
+        stopped_events = [
+            m for m in _drain_messages(self.stream) if m.get("event") == "stopped"
+        ]
+        real = stopped_events[-1]["body"]
+        self.assertIn("description", real)
+        self.assertIn("Snapshot", real["description"])
+        # HH:MM:SS.fff pattern must show up in the real-stop description.
+        self.assertRegex(real["description"], r"\d{2}:\d{2}:\d{2}\.\d{3}")
+
+    def test_description_mentions_exception_type(self) -> None:
+        st = _make_stacktrace(
+            100,
+            [_make_frame("/a/b.py", "foo", 1, {})],
+            thread_name="MainThread",
+            exception=KeyError("missing"),
+        )
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        real = [m for m in _drain_messages(self.stream) if m.get("event") == "stopped"][
+            -1
+        ]["body"]
+        self.assertIn("KeyError", real["description"])
+
+    def test_description_updates_across_snapshot_jumps(self) -> None:
+        snap1 = _make_snapshot(
+            [
+                _make_stacktrace(
+                    100,
+                    [_make_frame("/a/b.py", "foo", 1, {})],
+                    thread_name="MainThread",
+                )
+            ],
+            ts=1_700_000_000_000_000,
+        )
+        snap2 = _make_snapshot(
+            [
+                _make_stacktrace(
+                    100,
+                    [_make_frame("/a/b.py", "foo", 2, {})],
+                    thread_name="MainThread",
+                )
+            ],
+            ts=1_700_000_005_000_000,
+        )
+        self._launch_with_snapshots([snap1, snap2])
+
+        launch_desc = [
+            m for m in _drain_messages(self.stream) if m.get("event") == "stopped"
+        ][-1]["body"]["description"]
+        self.assertIn("1/2", launch_desc)
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=50,
+            command="tintypeJumpToSnapshot",
+            arguments={"index": 1},
+        )
+        jump_events = [
+            m for m in _drain_messages(self.stream) if m.get("event") == "stopped"
+        ]
+        # Jump emits exactly one stopped event (no bootstrap).
+        self.assertEqual(len(jump_events), 1)
+        jump_desc = jump_events[0]["body"]["description"]
+        self.assertIn("2/2", jump_desc)
+        self.assertNotEqual(launch_desc, jump_desc)
 
 
 if __name__ == "__main__":

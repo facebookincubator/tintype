@@ -14,6 +14,7 @@ installs the handlers onto a :class:`~tintype.dap.dispatcher.Dispatcher`.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import re
@@ -264,6 +265,13 @@ class SnapshotDebugSession:
         self._load_snapshot(start_index)
 
         self._emit_thread_events_started()
+        # Bootstrap-then-real emission pattern: VS Code overwrites the
+        # CALL STACK description on the very first ``stopped`` event of a
+        # launch, so we send a throwaway ``"Snapshot"`` first and
+        # immediately follow it with the real description. The second
+        # event is what the user actually sees. See
+        # :meth:`_send_stopped_event` for the full rationale.
+        self._send_stopped_event(bootstrap=True)
         self._send_stopped_event()
         return None
 
@@ -772,7 +780,22 @@ class SnapshotDebugSession:
                 "thread", {"reason": "started", "threadId": tid}
             )
 
-    def _send_stopped_event(self) -> None:
+    def _send_stopped_event(self, *, bootstrap: bool = False) -> None:
+        """Emit a ``stopped`` event for the current snapshot.
+
+        VS Code displays ``body.description`` in the CALL STACK panel
+        (next to the session row) and keeps whatever the most recent
+        ``stopped`` event provided — an absent ``description`` *clears*
+        the field rather than preserving the prior value. That's why we
+        set it on every emission.
+
+        The ``bootstrap`` flag is an initial-launch quirk: the very first
+        ``stopped`` event of the session is subject to a race where VS
+        Code overwrites whichever description the adapter provided.
+        Sending a bootstrap event (with a generic ``"Snapshot"`` label)
+        immediately followed by the real one lets the "real" description
+        settle in as the one the user sees.
+        """
         snapshot = self._current_snapshot
         if snapshot is None:
             return
@@ -792,12 +815,15 @@ class SnapshotDebugSession:
         has_exception = any(
             st.exception_object is not None for st in snapshot.stacktraces.values()
         )
-        body = {
+        description = "Snapshot" if bootstrap else self._snapshot_display_name(snapshot)
+        body: dict[str, Any] = {
             "reason": "exception" if has_exception else "pause",
             "threadId": thread_id,
             "preserveFocusHint": False,
             "allThreadsStopped": True,
         }
+        if description:
+            body["description"] = description
         self._dispatcher.send_event("stopped", body)
 
     # ---------------------------------------------------------------
@@ -903,6 +929,63 @@ class SnapshotDebugSession:
         if self._current_snapshot is None:
             raise DispatchError("no current snapshot; did launch succeed?")
         return self._current_snapshot
+
+    # ---------------------------------------------------------------
+    # Display-name helpers
+    # ---------------------------------------------------------------
+
+    def _snapshot_display_name(self, snapshot: Snapshot) -> str | None:
+        """One-line description of the current snapshot.
+
+        Surfaced via the ``stopped`` event's ``description`` field, which
+        VS Code renders next to the session row in CALL STACK. Keep it
+        short — the field is a single-line label and VS Code truncates.
+
+        Default format::
+
+            Snapshot {N}/{M} — {HH:MM:SS.fff} ({ExceptionType})
+
+        Returns ``None`` to suppress the description entirely.
+        """
+        parts: list[str] = []
+        try:
+            total = self._require_reader().snapshot_count()
+        except DispatchError:
+            total = 1
+        if total > 1:
+            parts.append(f"Snapshot {self._snapshot_index + 1}/{total}")
+        else:
+            parts.append("Snapshot")
+
+        try:
+            # ``snapshot.timestamp`` is microseconds since the Unix epoch.
+            # Format using UTC so cross-timezone teams opening the same
+            # ``.pytb`` see identical labels in CALL STACK (the label
+            # otherwise depends on the viewer's local wall clock, which
+            # is confusing when correlating snapshots with server-side
+            # timestamps).
+            ts_seconds = int(snapshot.timestamp) / 1_000_000.0
+            dt = datetime.datetime.fromtimestamp(ts_seconds, tz=datetime.timezone.utc)
+            parts.append("— " + dt.strftime("%H:%M:%S.%f")[:-3] + " UTC")
+        except (ValueError, OSError, OverflowError, TypeError) as e:
+            # Concrete failure modes of ``int()`` (TypeError / ValueError),
+            # ``fromtimestamp()`` (OverflowError / OSError on Windows for
+            # out-of-range timestamps), and attribute access on a
+            # malformed Snapshot (AttributeError is intentionally NOT
+            # caught — it signals a real bug, not a bad timestamp). Log
+            # at warning so bug reports can surface the real cause; the
+            # description field just loses the timestamp decoration.
+            logger.warning(
+                "failed to format timestamp for snapshot display name: %s", e
+            )
+
+        for st in snapshot.stacktraces.values():
+            exc = st.exception_object
+            if exc is not None:
+                parts.append(f"({type(exc).__name__})")
+                break
+
+        return " ".join(parts) if parts else None
 
 
 # ---------------------------------------------------------------
