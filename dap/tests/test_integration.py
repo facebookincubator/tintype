@@ -26,7 +26,7 @@ import unittest
 from typing import Any, Iterator
 
 import tintype
-from tintype.dap.server import serve
+from tintype.dap.server import run_session_on_stream, serve
 from tintype.dap.transport import BufferedSocketIO, read_message, write_message
 
 
@@ -190,6 +190,77 @@ class IntegrationTest(unittest.TestCase):
             self.assertTrue(term["success"])
 
             stream.close()
+
+
+class StdioIntegrationTest(unittest.TestCase):
+    """Drive :func:`run_session_on_stream` directly, no TCP involved.
+
+    Uses a ``socketpair`` to give both sides a real bidirectional byte
+    stream. Mirrors the happy-path of ``test_full_dap_sequence`` (the
+    TCP variant) but exercises the transport-agnostic ``ByteStream``
+    path that :func:`run_session_on_stdio` also uses against
+    ``sys.stdin.buffer`` / ``sys.stdout.buffer``. Keeps the test fast
+    and deterministic without binding a real TCP port.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._pytb_path = os.path.join(self._tmpdir.name, "test.pytb")
+        _make_snapshot_file(self._pytb_path)
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def test_initialize_launch_disconnect_over_stream(self) -> None:
+        server_sock, client_sock = socket.socketpair()
+        server_stream = BufferedSocketIO(server_sock)
+        client_stream = BufferedSocketIO(client_sock)
+
+        server_exit: dict[str, int] = {}
+
+        def target() -> None:
+            server_exit["rc"] = run_session_on_stream(server_stream)
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        try:
+            seq = [0]
+
+            def request(
+                command: str, arguments: dict[str, Any] | None = None
+            ) -> dict[str, Any]:
+                seq[0] += 1
+                write_message(
+                    client_stream,
+                    {
+                        "seq": seq[0],
+                        "type": "request",
+                        "command": command,
+                        "arguments": arguments or {},
+                    },
+                )
+                while True:
+                    msg = read_message(client_stream)
+                    if (
+                        msg.get("type") == "response"
+                        and msg.get("request_seq") == seq[0]
+                    ):
+                        return msg
+
+            init = request("initialize", {})
+            self.assertTrue(init["success"])
+
+            launch = request("launch", {"pytbPath": self._pytb_path})
+            self.assertTrue(launch["success"])
+
+            # Disconnect terminates the session cleanly.
+            term = request("disconnect")
+            self.assertTrue(term["success"])
+        finally:
+            client_stream.close()
+            thread.join(timeout=5)
+
+        self.assertEqual(server_exit.get("rc"), 0)
 
 
 if __name__ == "__main__":

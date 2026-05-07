@@ -176,6 +176,56 @@ def _run_session(client_sock: socket.socket) -> int:
     return run_session_on_stream(stream)
 
 
+class _StdioStream:
+    """``ByteStream`` adapter over the process's stdin/stdout binary buffers.
+
+    Reads from ``sys.stdin.buffer`` and writes to ``sys.stdout.buffer``.
+    Each ``write`` flushes so the DAP client observes responses promptly
+    without relying on Python's default stdout buffering (which would
+    otherwise wait for a block to fill before forwarding).
+    """
+
+    def __init__(
+        self,
+        reader: Any | None = None,
+        writer: Any | None = None,
+    ) -> None:
+        # pyre-ignore[4] — duck-typed binary streams
+        self._reader = reader if reader is not None else sys.stdin.buffer
+        # pyre-ignore[4]
+        self._writer = writer if writer is not None else sys.stdout.buffer
+
+    def read(self, size: int = -1, /) -> bytes:
+        return self._reader.read(size)
+
+    def write(self, data: bytes, /) -> int:
+        n = self._writer.write(data)
+        self._writer.flush()
+        return n if n is not None else len(data)
+
+    def flush(self) -> None:
+        self._writer.flush()
+
+    def close(self) -> None:
+        # Don't close the real stdin/stdout — they're owned by the
+        # interpreter. A no-op here is fine: the session-loop uses
+        # ``close()`` as a hint rather than a hard teardown and the
+        # process will tear them down at exit.
+        pass
+
+
+def run_session_on_stdio() -> int:
+    """Serve a single DAP session over stdin/stdout.
+
+    Standard DAP transport for editor-launched debug adapters; VS Code's
+    ``DebugAdapterExecutable`` descriptor connects to the adapter this
+    way by default. No announcement protocol is needed — the editor
+    learns the transport from the descriptor it built.
+    """
+    stream = _StdioStream()
+    return run_session_on_stream(stream)
+
+
 def run_session_on_stream(stream: ByteStream) -> int:
     """Run the request/response loop against an already-established stream.
 
