@@ -165,6 +165,76 @@ class SnapshotSourceFileTest(unittest.TestCase):
                 self.assertIsInstance(sf.path, str)
                 self.assertGreater(len(sf.path), 0)
 
+    def test_synthetic_string_filename_not_staged(self) -> None:
+        """CPython synthetic filenames like ``<string>`` (from
+        ``compile(code, "<string>", "exec")``) must not be staged into
+        the extracted-files directory. Previously the path-construction
+        used a raw ``extractedFilesDir_ + file.path`` concat with no
+        separator, producing garbage paths like
+        ``/tmp/snapshot_files_Xxxxxx<string>`` that then became the
+        frame's ``file_path`` on read. The fix skips synthetic
+        ``<...>`` entries so the frame keeps its honest ``<string>``
+        filename and downstream filters can match an anchored
+        pattern.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "string_frame.pytb")
+            tintype.initialize()
+            # ``compile(..., "<string>", "exec")`` + ``exec`` produces a
+            # frame whose ``co_filename`` is ``<string>``. Taking the
+            # snapshot from inside that exec captures that frame.
+            code = compile("tintype.take_snapshot()", "<string>", "exec")
+            exec(code, {"tintype": tintype})
+            tintype.finalize(path)
+
+            reader = tintype.SnapshotReader(path)
+
+            # 1. No ``<`` paths should be staged. ``os.walk`` safely
+            #    yields nothing for empty / nonexistent dirs, so the
+            #    assertion runs whether or not the reader created an
+            #    extracted-files dir for this snapshot.
+            extracted_dir = reader.get_extracted_files_dir() or ""
+            for dirpath, _dirs, files in os.walk(extracted_dir):
+                for name in files:
+                    leaked_path = os.path.join(dirpath, name)
+                    self.assertNotIn(
+                        "<",
+                        name,
+                        f"Synthetic filename leaked into extracted dir: {leaked_path}",
+                    )
+                    self.assertNotIn(
+                        ">",
+                        name,
+                        f"Synthetic filename leaked into extracted dir: {leaked_path}",
+                    )
+
+            # 2. Any frame whose original ``co_filename`` was
+            #    ``<string>`` must surface with exactly ``<string>`` as
+            #    its ``file_path`` (unchanged, no tmp-dir prefix).
+            snap = reader.get_latest_snapshot()
+            self.assertIsNotNone(snap)
+            found_string_frame = False
+            for st in snap.stacktraces.values():
+                for frame in st.frames:
+                    if frame.file_path == "<string>":
+                        found_string_frame = True
+                    # Either the path is exactly ``<string>`` or it
+                    # does not contain the ``<string>`` substring at
+                    # all (i.e., no munged concatenation).
+                    if "<string>" in frame.file_path:
+                        self.assertEqual(
+                            frame.file_path,
+                            "<string>",
+                            "Frame file_path contains '<string>' as a "
+                            "substring of a munged path: "
+                            f"{frame.file_path!r}",
+                        )
+            self.assertTrue(
+                found_string_frame,
+                "Test setup did not produce a frame with co_filename "
+                "'<string>'; the test cannot verify the staging fix.",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

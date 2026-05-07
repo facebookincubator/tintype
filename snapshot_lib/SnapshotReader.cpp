@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
@@ -472,6 +473,22 @@ bool SnapshotReader::extractSourceFiles() {
         // Original file matches, no mapping needed (readFrameAt will use
         // the original path directly when it's not found in the map)
       } else {
+        // Skip CPython synthetic filenames (e.g. "<string>", "<stdin>",
+        // "<frozen importlib._bootstrap>"). These come from
+        // ``compile(code, "<string>", "exec")``-style code objects —
+        // there is no source file on disk, the content bundled into
+        // the snapshot is typically empty, and the raw concat below
+        // (which relies on file.path starting with '/') would produce
+        // unusable paths like "/tmp/snapshot_files_XXXXXX<string>".
+        // Skipping the map entry here means readFrameAt falls through
+        // to the ``originalFilePath`` branch and the frame keeps its
+        // honest "<string>" filename, which filters downstream can
+        // match with an anchored pattern.
+        if (!file.path.empty() && file.path.front() == '<') {
+          offset += bytesRead;
+          continue;
+        }
+
         // Need to extract to temp directory
         // Create temp directory if not already created
         if (!tempDirCreated) {
@@ -486,15 +503,60 @@ bool SnapshotReader::extractSourceFiles() {
           tempDirCreated = true;
         }
 
-        // Create the full path within the temp directory
-        std::string extractedPath = extractedFilesDir_ + file.path;
-
-        // Create parent directories as needed
-        size_t pos = 0;
-        while ((pos = extractedPath.find('/', pos + 1)) != std::string::npos) {
-          std::string dirPath = extractedPath.substr(0, pos);
-          mkdir(dirPath.c_str(), 0755);
+        // Use std::filesystem to properly join the staging dir with
+        // file.path so non-absolute source paths (e.g. "./script.py"
+        // or "fbvscode/__init__.py" as seen in lazy-import .par
+        // layouts) do not produce unseparated junk like
+        // "/tmp/snapshot_files_XXXXXX./script.py".
+        //
+        // ``fs::path::operator/`` treats an absolute RHS as "replace
+        // the LHS entirely" — which would strip off
+        // ``extractedFilesDir_`` — so explicitly drop the root from
+        // ``src`` with ``relative_path()`` before joining.
+        // ``lexically_normal()`` collapses any ``.`` / ``..``
+        // components so the final path is a sensible subpath of
+        // ``extractedFilesDir_``.
+        namespace fs = std::filesystem;
+        fs::path src(file.path);
+        if (src.is_absolute()) {
+          // ``fs::path::operator/`` treats an absolute RHS as "replace
+          // the LHS entirely" — which would strip off
+          // ``extractedFilesDir_`` — so drop the root-directory
+          // component to preserve the source hierarchy under
+          // ``extractedFilesDir_``.
+          src = src.relative_path();
         }
+        fs::path stagingDir(extractedFilesDir_);
+        fs::path extractedPath = (stagingDir / src).lexically_normal();
+        if (extractedPath.empty() || extractedPath == stagingDir) {
+          // file.path was empty / all-slashes / pure ``.`` —
+          // nothing sensible to stage.
+          offset += bytesRead;
+          continue;
+        }
+        // Zip-slip guard: ``lexically_normal()`` collapses ``..``
+        // components, which means a crafted snapshot containing a
+        // relative ``file.path`` like ``../../etc/crontab`` would
+        // otherwise resolve to a path OUTSIDE ``extractedFilesDir_``
+        // and clobber arbitrary files on disk. The raw-concat code
+        // this replaces was accidentally immune (because ``..`` just
+        // became part of a literal directory name), so we have to
+        // enforce the "stays in staging dir" invariant explicitly
+        // now that we do real path arithmetic.
+        std::error_code relEc;
+        fs::path rel = fs::relative(extractedPath, stagingDir, relEc);
+        if (relEc || rel.empty() || rel.native().starts_with("..")) {
+          lastError_ = "skipped extracted path that escapes staging directory";
+          offset += bytesRead;
+          continue;
+        }
+
+        // Create parent directories as needed.
+        std::error_code mkdirEc;
+        fs::create_directories(extractedPath.parent_path(), mkdirEc);
+        // Ignore mkdirEc — the ofstream below will fail to open and
+        // the write will be skipped if we somehow can't create the
+        // directory hierarchy.
 
         // Write the file content
         std::ofstream outFile(extractedPath, std::ios::binary);
@@ -503,7 +565,7 @@ bool SnapshotReader::extractSourceFiles() {
         }
 
         // Map original path to extracted path
-        extractedFilePathMap_[file.path] = extractedPath;
+        extractedFilePathMap_[file.path] = extractedPath.string();
       }
     }
 
