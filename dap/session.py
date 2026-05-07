@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable
+import re
+from typing import Any, Callable, Iterable
 
 from tintype import Frame, Snapshot, SnapshotReader, Stacktrace
 from tintype.dap.dispatcher import Dispatcher, DispatchError
@@ -27,6 +28,99 @@ from tintype.dap.variables import expand, make_variable, VariableRegistry
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# Frame-path patterns (regex, matched against ``frame.file_path`` with
+# ``re.search``) whose frames are treated as "framework noise" by
+# default. Debugger-injected frames from pydevd/debugpy dominate the
+# CALL STACK on snapshots captured while the program is paused under
+# debugpy, so we deemphasize them unless the launch config overrides.
+# Users can replace this list via the launch config's
+# ``excludeFramePaths`` field, or re-include specific files via
+# ``includeFramePaths`` (which wins over excludes).
+DEFAULT_EXCLUDE_FRAME_PATHS: list[str] = [
+    # Directory-anchored pydevd / debugpy / pydev patterns. These catch
+    # the real package layouts (``.../pydevd/...``, ``.../debugpy/...``,
+    # ``.../_pydev_.../...``) without matching on filename alone, so a
+    # user script that happens to be named ``pydevd.py`` does NOT get
+    # deemphasized.
+    r"/pydevd[_/]",
+    r"/debugpy[_/]",
+    r"/_pydev_",
+    r"/pydev_ipython/",
+    # ``threading.Thread.__init__`` and ``Thread._bootstrap*`` frames
+    # bracket every real user thread; they're part of the CPython
+    # stdlib plumbing, not the user's call stack. Anchor on the
+    # ``lib/python3.X`` path component so a user project file named
+    # ``threading.py`` (e.g. ``/my_proj/threading.py``) doesn't get
+    # deemphasized along with the stdlib one.
+    r"/lib/python3\.\d+/threading\.py$",
+    # Same rationale for ``queue.py``: pydevd's command-queue worker
+    # and CPython's own ``Thread`` helpers park inside
+    # ``queue.Queue.get``/``put`` between work items, so those frames
+    # show up at the bottom of every worker-thread stack trace. Anchor
+    # on the ``lib/python3.X`` path component so a user project file
+    # named ``queue.py`` is not affected.
+    r"/lib/python3\.\d+/queue\.py$",
+    # ``compile(code_str, "<string>", "exec")`` — used by pydevd to run
+    # debug-console ``evaluate`` expressions (including the tintype
+    # snapshot-capture helper itself) and by any user call to
+    # ``eval``/``exec`` on a bare string. CPython sets ``co_filename``
+    # to the literal ``"<string>"`` for these code objects; the top
+    # frame's ``co_name`` is the generic ``"<module>"`` top-level
+    # scope marker.
+    #
+    # The ``^...$`` anchor is deliberately strict: angle brackets are
+    # not valid characters in filenames on real filesystems, so this
+    # cannot collide with a user source file. Historically a looser
+    # ``<string>$`` anchor was needed because
+    # ``SnapshotReader::extractSourceFiles`` concatenated
+    # ``extractedFilesDir_ + file.path`` without a separator,
+    # producing munged paths like ``/tmp/snapshot_files_Xxxxxx<string>``
+    # that also had to be deemphasized. That bug was fixed in the
+    # reader (see ``tintype/snapshot_lib/SnapshotReader.cpp`` —
+    # synthetic ``<...>`` filenames are now skipped at stage time and
+    # the frame's ``file_path`` is preserved as the raw ``<string>``),
+    # so the tighter anchor is safe again.
+    r"^<string>$",
+]
+
+
+def extend_default_exclude_frame_paths(patterns: Iterable[str]) -> None:
+    """Append ``patterns`` to :data:`DEFAULT_EXCLUDE_FRAME_PATHS`.
+
+    The public tintype module is PyPI-published and can't know about
+    Meta-internal noise (``/sand/``, ``fbvscode_traceback``, etc.).
+    Meta-specific wrappers import this function at module-load time and
+    call it before the DAP server starts, so the augmented list is in
+    place by the time any ``launch`` request is processed.
+
+    This API mutates the module-level list in-place. Callers that
+    import ``DEFAULT_EXCLUDE_FRAME_PATHS`` directly will see the
+    extended list on subsequent reads. Calling this multiple times
+    appends additively — it does not deduplicate, so wrappers should
+    call it once per import cycle.
+
+    Duplicates are harmless (``re.search`` short-circuits on the first
+    match) but do grow the per-frame filter cost linearly, so keep the
+    list reasonable.
+    """
+    for pattern in patterns:
+        if not isinstance(pattern, str) or not pattern:
+            continue
+        DEFAULT_EXCLUDE_FRAME_PATHS.append(pattern)
+
+
+def set_default_exclude_frame_paths(patterns: Iterable[str]) -> None:
+    """Replace :data:`DEFAULT_EXCLUDE_FRAME_PATHS` wholesale.
+
+    Use this when a wrapper needs full control — e.g. a library that
+    embeds tintype in a non-Python environment and the default
+    pydevd/debugpy patterns aren't relevant. Most callers should prefer
+    :func:`extend_default_exclude_frame_paths` so the baseline
+    suppression set stays intact.
+    """
+    DEFAULT_EXCLUDE_FRAME_PATHS[:] = [p for p in patterns if isinstance(p, str) and p]
 
 
 class SnapshotDebugSession:
@@ -64,6 +158,16 @@ class SnapshotDebugSession:
         # exception. Cleared to ``None`` at launch so the very first
         # stop uses the exception-first fallback.
         self._preferred_thread_name: str | None = None
+
+        # Frame-path filter state populated from the launch config. See
+        # DEFAULT_EXCLUDE_FRAME_PATHS for the baseline pydevd/debugpy
+        # suppression set. ``_hide_filtered_frames`` controls whether
+        # matching frames are omitted from ``stackTrace`` responses
+        # (True) or merely marked with ``presentationHint:
+        # "deemphasize"`` (False — default).
+        self._exclude_frame_patterns: list[re.Pattern[str]] = []
+        self._include_frame_patterns: list[re.Pattern[str]] = []
+        self._hide_filtered_frames: bool = False
 
         self._terminated: bool = False
 
@@ -145,6 +249,7 @@ class SnapshotDebugSession:
         self._reader = reader
         self._pytb_path = pytb
         self._sources.load_from_reader(reader)
+        self._configure_frame_filters(arguments)
 
         self._dispatcher.send_event("initialized")
 
@@ -211,10 +316,101 @@ class SnapshotDebugSession:
     # Handlers — introspection
     # ---------------------------------------------------------------
 
+    def _configure_frame_filters(self, arguments: dict[str, Any]) -> None:
+        """Parse the frame-filter launch arguments into compiled regexes.
+
+        ``excludeFramePaths`` — list of regex strings. Falls back to
+        :data:`DEFAULT_EXCLUDE_FRAME_PATHS` when omitted. Pass an empty
+        list to disable filtering entirely.
+
+        ``includeFramePaths`` — list of regex strings that override
+        excludes (wins if any pattern matches). Useful for pulling a
+        specific debugpy file back into view while keeping the rest
+        suppressed.
+
+        ``hideFilteredFrames`` — when true, matching frames are dropped
+        from ``stackTrace`` responses. When false (default), frames are
+        marked with ``presentationHint: "deemphasize"`` so VS Code
+        renders them in italic/grey but keeps them clickable.
+
+        Invalid regexes are reported via an ``output`` event and
+        skipped, so a typo in one pattern doesn't break the session.
+        """
+        raw_excludes = arguments.get("excludeFramePaths")
+        if raw_excludes is None:
+            raw_excludes = DEFAULT_EXCLUDE_FRAME_PATHS
+        raw_includes = arguments.get("includeFramePaths") or []
+        self._exclude_frame_patterns = self._compile_patterns(
+            raw_excludes, label="excludeFramePaths"
+        )
+        self._include_frame_patterns = self._compile_patterns(
+            raw_includes, label="includeFramePaths"
+        )
+        self._hide_filtered_frames = bool(arguments.get("hideFilteredFrames", False))
+
+    def _compile_patterns(self, raw: object, *, label: str) -> list[re.Pattern[str]]:
+        if not isinstance(raw, list):
+            return []
+        compiled: list[re.Pattern[str]] = []
+        for entry in raw:
+            if not isinstance(entry, str) or not entry:
+                continue
+            try:
+                compiled.append(re.compile(entry))
+            except re.error as exc:
+                self._dispatcher.send_event(
+                    "output",
+                    {
+                        "category": "console",
+                        "output": (
+                            f"tintype: skipping invalid {label} pattern "
+                            f"{entry!r}: {exc}\n"
+                        ),
+                    },
+                )
+        return compiled
+
+    def _is_filtered_frame(self, frame: Frame) -> bool:
+        """True if ``frame`` matches the user's exclude filter.
+
+        Includes win over excludes: if any include pattern matches, the
+        frame is kept regardless of what excludes say. This lets users
+        "subtract" specific files from a broad exclude pattern.
+        """
+        path = frame.file_path or ""
+        if any(p.search(path) for p in self._include_frame_patterns):
+            return False
+        return any(p.search(path) for p in self._exclude_frame_patterns)
+
+    def _is_filtered_thread(self, stacktrace: Stacktrace) -> bool:
+        """True if every frame in the thread is filtered.
+
+        These are pydevd's service threads (Reader, Writer,
+        CommandThread, etc.) — they carry no user value and just clutter
+        the threads list. We drop them from ``handle_threads`` entirely;
+        there's no DAP concept of a "deemphasized thread" so hide-mode
+        is the only sensible behavior here.
+
+        Threads with at least one user frame are never filtered out of
+        the threads list — the filter only applies within the stack.
+        """
+        # ``all()`` short-circuits on the first False, so we can skip
+        # materializing the full frame list.  ``all([])`` is True in
+        # Python, so we use a sentinel to distinguish "no frames at all"
+        # (an empty thread, not filtered) from "every frame is filtered".
+        any_frame = False
+        for frame in stacktrace.frames:
+            any_frame = True
+            if not self._is_filtered_frame(frame):
+                return False
+        return any_frame
+
     def handle_threads(self, _arguments: dict[str, Any]) -> dict[str, Any]:
         snapshot = self._require_snapshot()
         threads: list[dict[str, Any]] = []
         for stacktrace in snapshot.stacktraces.values():
+            if self._is_filtered_thread(stacktrace):
+                continue
             threads.append(
                 {
                     "id": int(stacktrace.id),
@@ -244,7 +440,14 @@ class SnapshotDebugSession:
         # DAP expects frame[0] to be the innermost (most recently called)
         # frame. Tintype already stores frames innermost-first, so we must
         # NOT reverse — return them as-is.
-        ordered = list(stacktrace.frames)
+        all_frames = list(stacktrace.frames)
+        # When ``hideFilteredFrames`` is on, drop matching frames
+        # entirely so they never reach the client. Otherwise we keep
+        # them and let ``_format_frame`` apply the deemphasize hint.
+        if self._hide_filtered_frames:
+            ordered = [f for f in all_frames if not self._is_filtered_frame(f)]
+        else:
+            ordered = all_frames
         total = len(ordered)
 
         if start_frame < 0:
@@ -617,13 +820,22 @@ class SnapshotDebugSession:
         return frame_id
 
     def _format_frame(self, frame_id: int, frame: Frame) -> dict[str, Any]:
+        # When ``hideFilteredFrames`` is on, callers have already
+        # dropped matching frames before we get here — so anything we
+        # see is a frame the user wants to see. In the default (not
+        # hidden) mode, we keep matching frames but mark them
+        # ``"deemphasize"`` so VS Code renders them italic/grey while
+        # still letting the user click through.
+        hint = "normal"
+        if not self._hide_filtered_frames and self._is_filtered_frame(frame):
+            hint = "deemphasize"
         return {
             "id": frame_id,
             "name": frame.function_qualname or frame.function_name,
             "line": int(frame.line_number),
             "column": 1,
             "source": self._sources.describe(frame.file_path),
-            "presentationHint": "normal",
+            "presentationHint": hint,
         }
 
     def _lookup_frame(self, frame_id: int) -> Frame | None:

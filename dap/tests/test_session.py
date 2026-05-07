@@ -19,7 +19,12 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from tintype.dap.dispatcher import Dispatcher
-from tintype.dap.session import SnapshotDebugSession
+from tintype.dap.session import (
+    DEFAULT_EXCLUDE_FRAME_PATHS,
+    extend_default_exclude_frame_paths,
+    set_default_exclude_frame_paths,
+    SnapshotDebugSession,
+)
 from tintype.dap.transport import read_message
 
 
@@ -102,6 +107,16 @@ class SessionHandlerTest(unittest.TestCase):
         self.dispatcher = Dispatcher(self.stream)
         self.session = SnapshotDebugSession(self.dispatcher)
         self.session.wire()
+        # Snapshot the module-level default exclude list so tests that
+        # mutate it (via extend / set helpers) can't leak state between
+        # cases. ``tearDown`` restores the list in-place even if the
+        # test fails before its own ``finally`` block would run — which
+        # is exactly the brittleness that made the previous in-method
+        # ``try/finally`` pattern unsafe.
+        self._saved_default_exclude: list[str] = list(DEFAULT_EXCLUDE_FRAME_PATHS)
+
+    def tearDown(self) -> None:
+        DEFAULT_EXCLUDE_FRAME_PATHS[:] = self._saved_default_exclude
 
     def _launch_with_snapshots(self, snapshots: list[Any]) -> MagicMock:
         """Patch SnapshotReader to yield ``snapshots`` and send ``launch``."""
@@ -890,6 +905,473 @@ class SessionHandlerTest(unittest.TestCase):
         jump_messages = _drain_messages(self.stream)
         jump_stopped = next(m for m in jump_messages if m.get("event") == "stopped")
         self.assertEqual(jump_stopped["body"]["threadId"], 200)
+
+    def test_default_filter_deemphasizes_pydevd_debugpy_frames(self) -> None:
+        """Out of the box, pydevd/debugpy frames should be deemphasized."""
+        # Innermost first (DAP order, matching tintype's storage).
+        user_frame = _make_frame("/app/main.py", "main", 10, {})
+        pydevd_frame = _make_frame(
+            "/usr/lib/python3/site-packages/pydevd/pydevd.py",
+            "do_wait_suspend",
+            1234,
+            {},
+        )
+        debugpy_frame = _make_frame(
+            "/usr/lib/python3/site-packages/debugpy/_vendored/pydevd/_pydev_imps/_pydev_execfile.py",
+            "execfile",
+            25,
+            {},
+        )
+        st = _make_stacktrace(
+            100,
+            [user_frame, pydevd_frame, debugpy_frame],
+            thread_name="MainThread",
+        )
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=600,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+        resp = _drain_messages(self.stream)[0]
+        self.assertTrue(resp["success"])
+        frames = resp["body"]["stackFrames"]
+        self.assertEqual(
+            len(frames), 3, "all frames should still be present by default"
+        )
+
+        # User frame stays ``normal``; pydevd + debugpy frames get
+        # ``deemphasize``.
+        hints = [f["presentationHint"] for f in frames]
+        self.assertEqual(hints[0], "normal")
+        self.assertEqual(hints[1], "deemphasize")
+        self.assertEqual(hints[2], "deemphasize")
+
+    def test_hide_filtered_frames_drops_them_from_stack(self) -> None:
+        """``hideFilteredFrames: true`` removes matching frames entirely."""
+        user_frame = _make_frame("/app/main.py", "main", 10, {})
+        pydevd_frame = _make_frame("/pydevd/pydevd.py", "do_wait_suspend", 1, {})
+        st = _make_stacktrace(100, [user_frame, pydevd_frame], thread_name="MainThread")
+        snap = _make_snapshot([st])
+
+        reader = MagicMock()
+        reader.snapshot_count.return_value = 1
+        reader.get_all_source_files.return_value = []
+        reader.get_all_snapshots.return_value = [snap]
+        reader.get_snapshot_at_index.side_effect = lambda i: snap if i == 0 else None
+
+        with (
+            patch("tintype.dap.session.SnapshotReader", return_value=reader),
+            patch("tintype.dap.session.os.path.isfile", return_value=True),
+        ):
+            _send_request(
+                self.session,
+                self.dispatcher,
+                seq=1,
+                command="launch",
+                arguments={
+                    "pytbPath": "/fake/snap.pytb",
+                    "hideFilteredFrames": True,
+                },
+            )
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=601,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+        resp = _drain_messages(self.stream)[0]
+        frames = resp["body"]["stackFrames"]
+        # Only the user frame remains.
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["name"], "main")
+        # And it's marked normal (no deemphasize in hide mode).
+        self.assertEqual(frames[0]["presentationHint"], "normal")
+        # totalFrames must reflect the post-filter count so scrolling
+        # doesn't try to load phantom frames.
+        self.assertEqual(resp["body"]["totalFrames"], 1)
+
+    def test_include_pattern_rescues_specific_file(self) -> None:
+        """``includeFramePaths`` wins over excludes for matching paths."""
+        user_frame = _make_frame("/app/main.py", "main", 10, {})
+        rescued_frame = _make_frame(
+            "/pydevd/_pydevd_bundle/pydevd_runpy.py", "run_module_as_main", 1, {}
+        )
+        other_pydevd_frame = _make_frame("/pydevd/pydevd.py", "do_wait_suspend", 1, {})
+        st = _make_stacktrace(
+            100,
+            [user_frame, rescued_frame, other_pydevd_frame],
+            thread_name="MainThread",
+        )
+        snap = _make_snapshot([st])
+
+        reader = MagicMock()
+        reader.snapshot_count.return_value = 1
+        reader.get_all_source_files.return_value = []
+        reader.get_all_snapshots.return_value = [snap]
+        reader.get_snapshot_at_index.side_effect = lambda i: snap if i == 0 else None
+
+        with (
+            patch("tintype.dap.session.SnapshotReader", return_value=reader),
+            patch("tintype.dap.session.os.path.isfile", return_value=True),
+        ):
+            _send_request(
+                self.session,
+                self.dispatcher,
+                seq=1,
+                command="launch",
+                arguments={
+                    "pytbPath": "/fake/snap.pytb",
+                    "includeFramePaths": ["pydevd_runpy\\.py"],
+                },
+            )
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=602,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+        resp = _drain_messages(self.stream)[0]
+        frames = resp["body"]["stackFrames"]
+        self.assertEqual(len(frames), 3)
+        hints = [f["presentationHint"] for f in frames]
+        # User frame: normal. Rescued pydevd_runpy: normal (include wins).
+        # Other pydevd frame: deemphasize.
+        self.assertEqual(hints[0], "normal")
+        self.assertEqual(hints[1], "normal")
+        self.assertEqual(hints[2], "deemphasize")
+
+    def test_pydevd_only_thread_is_omitted_from_threads_response(self) -> None:
+        """Threads consisting entirely of filtered frames are dropped."""
+        user_st = _make_stacktrace(
+            100,
+            [_make_frame("/app/main.py", "main", 1, {})],
+            thread_name="MainThread",
+        )
+        # pydevd service thread — all frames come from pydevd.
+        service_st = _make_stacktrace(
+            200,
+            [
+                _make_frame("/pydevd/pydevd.py", "_on_run", 1, {}),
+                _make_frame("/pydevd/pydevd_comm.py", "run", 1, {}),
+            ],
+            thread_name="pydevd.Reader",
+        )
+        snap = _make_snapshot([user_st, service_st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(self.session, self.dispatcher, seq=700, command="threads")
+        resp = _drain_messages(self.stream)[0]
+        threads = resp["body"]["threads"]
+        # Only MainThread survives.
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0]["id"], 100)
+
+    def test_user_thread_with_mixed_frames_is_kept(self) -> None:
+        """A thread with any user frame survives — only the frames are filtered."""
+        mixed_st = _make_stacktrace(
+            100,
+            [
+                _make_frame("/app/main.py", "main", 1, {}),
+                _make_frame("/pydevd/pydevd.py", "do_wait_suspend", 1, {}),
+            ],
+            thread_name="MainThread",
+        )
+        snap = _make_snapshot([mixed_st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(self.session, self.dispatcher, seq=701, command="threads")
+        threads_resp = _drain_messages(self.stream)[0]
+        self.assertEqual(len(threads_resp["body"]["threads"]), 1)
+
+    def test_explicit_empty_exclude_list_disables_filter(self) -> None:
+        """Passing ``excludeFramePaths: []`` disables the default filter."""
+        pydevd_frame = _make_frame("/pydevd/pydevd.py", "do_wait_suspend", 1, {})
+        st = _make_stacktrace(100, [pydevd_frame], thread_name="MainThread")
+        snap = _make_snapshot([st])
+
+        reader = MagicMock()
+        reader.snapshot_count.return_value = 1
+        reader.get_all_source_files.return_value = []
+        reader.get_all_snapshots.return_value = [snap]
+        reader.get_snapshot_at_index.side_effect = lambda i: snap if i == 0 else None
+
+        with (
+            patch("tintype.dap.session.SnapshotReader", return_value=reader),
+            patch("tintype.dap.session.os.path.isfile", return_value=True),
+        ):
+            _send_request(
+                self.session,
+                self.dispatcher,
+                seq=1,
+                command="launch",
+                arguments={
+                    "pytbPath": "/fake/snap.pytb",
+                    "excludeFramePaths": [],
+                },
+            )
+
+        # With an empty exclude list, the pydevd-only thread should NOT
+        # be filtered out — the filter is disabled entirely.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(self.session, self.dispatcher, seq=702, command="threads")
+        threads_resp = _drain_messages(self.stream)[0]
+        self.assertEqual(len(threads_resp["body"]["threads"]), 1)
+        self.assertEqual(threads_resp["body"]["threads"][0]["id"], 100)
+
+        # And the frame should render normal.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=703,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+        stack_resp = _drain_messages(self.stream)[0]
+        self.assertEqual(
+            stack_resp["body"]["stackFrames"][0]["presentationHint"], "normal"
+        )
+
+    def test_invalid_regex_is_skipped_with_output_event(self) -> None:
+        """A bad pattern shouldn't break the session — just warn and skip."""
+        user_frame = _make_frame("/app/main.py", "main", 1, {})
+        st = _make_stacktrace(100, [user_frame], thread_name="MainThread")
+        snap = _make_snapshot([st])
+
+        reader = MagicMock()
+        reader.snapshot_count.return_value = 1
+        reader.get_all_source_files.return_value = []
+        reader.get_all_snapshots.return_value = [snap]
+        reader.get_snapshot_at_index.side_effect = lambda i: snap if i == 0 else None
+
+        with (
+            patch("tintype.dap.session.SnapshotReader", return_value=reader),
+            patch("tintype.dap.session.os.path.isfile", return_value=True),
+        ):
+            _send_request(
+                self.session,
+                self.dispatcher,
+                seq=1,
+                command="launch",
+                arguments={
+                    "pytbPath": "/fake/snap.pytb",
+                    "excludeFramePaths": ["[unclosed"],
+                },
+            )
+
+        messages = _drain_messages(self.stream)
+        outputs = [
+            m
+            for m in messages
+            if m.get("event") == "output"
+            and "invalid excludeFramePaths" in m["body"].get("output", "")
+        ]
+        self.assertEqual(len(outputs), 1)
+
+    def test_default_filter_deemphasizes_threading_frames(self) -> None:
+        """``threading.py`` is part of the default exclude set."""
+        user_frame = _make_frame("/app/main.py", "main", 10, {})
+        threading_bootstrap = _make_frame(
+            "/usr/lib/python3.14/threading.py", "_bootstrap", 1012, {}
+        )
+        threading_inner = _make_frame(
+            "/usr/lib/python3.14/threading.py", "_bootstrap_inner", 1022, {}
+        )
+        st = _make_stacktrace(
+            100,
+            [user_frame, threading_bootstrap, threading_inner],
+            thread_name="Worker",
+        )
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=800,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+        resp = _drain_messages(self.stream)[0]
+        frames = resp["body"]["stackFrames"]
+        self.assertEqual(
+            [f["presentationHint"] for f in frames],
+            ["normal", "deemphasize", "deemphasize"],
+        )
+
+    def test_default_filter_deemphasizes_queue_frames(self) -> None:
+        """``queue.py`` plumbing is part of the default exclude set."""
+        user_frame = _make_frame("/app/main.py", "main", 10, {})
+        queue_get = _make_frame("/usr/lib/python3.14/queue.py", "get", 171, {})
+        st = _make_stacktrace(101, [user_frame, queue_get], thread_name="Worker")
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=801,
+            command="stackTrace",
+            arguments={"threadId": 101},
+        )
+        resp = _drain_messages(self.stream)[0]
+        frames = resp["body"]["stackFrames"]
+        self.assertEqual(
+            [f["presentationHint"] for f in frames],
+            ["normal", "deemphasize"],
+        )
+
+    def test_default_filter_deemphasizes_string_exec_frames(self) -> None:
+        """Frames whose ``co_filename`` is exactly ``<string>`` —
+        produced by ``compile(code, "<string>", "exec")`` (e.g. pydevd
+        evaluate requests and user ``eval``/``exec`` calls) — are
+        deemphasized without matching real user source files.
+
+        The anchor is ``^<string>$`` (exact match). Historically the
+        C++ ``SnapshotReader`` also surfaced munged paths like
+        ``/tmp/snapshot_files_Xxxxxx<string>`` via a raw
+        ``extractedFilesDir_ + file.path`` concat; the reader now
+        skips synthetic ``<...>`` filenames at stage time (see
+        ``tintype/snapshot_lib/SnapshotReader.cpp``), so the frame's
+        ``file_path`` is preserved as the raw ``<string>`` and the
+        tight anchor is sufficient. A hypothetical munged path that
+        somehow still appeared should render normally — the
+        ``^...$`` anchor protects against over-matching real paths
+        that merely happen to end in the literal ``<string>``
+        substring.
+        """
+        user_frame = _make_frame("/app/main.py", "main", 10, {})
+        evaluate_frame = _make_frame("<string>", "<module>", 1, {})
+        # Munged path that the pre-fix SnapshotReader used to produce.
+        # The reader fix prevents this shape from surfacing in new
+        # snapshots, so we now treat it as a normal path — we cannot
+        # safely deemphasize arbitrary paths ending in ``<string>``
+        # because ``<``/``>`` *are* legal on some filesystems.
+        hypothetical_munged = _make_frame(
+            "/tmp/snapshot_files_Dgqcba<string>", "<module>", 1, {}
+        )
+        # A deliberately crafted path containing ``<string>`` mid-name
+        # — the ``^...$`` anchor rejects these.
+        user_lookalike = _make_frame("/app/weird<string>file.py", "run", 5, {})
+        st = _make_stacktrace(
+            102,
+            [user_frame, user_lookalike, evaluate_frame, hypothetical_munged],
+            thread_name="MainThread",
+        )
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=802,
+            command="stackTrace",
+            arguments={"threadId": 102},
+        )
+        resp = _drain_messages(self.stream)[0]
+        frames = resp["body"]["stackFrames"]
+        self.assertEqual(
+            [f["presentationHint"] for f in frames],
+            ["normal", "normal", "deemphasize", "normal"],
+        )
+
+    def test_extend_default_exclude_frame_paths_appends_additively(self) -> None:
+        """Meta-internal wrappers can append their own patterns."""
+        original = self._saved_default_exclude
+        extend_default_exclude_frame_paths(
+            [r"/my_internal_framework/", r"/fb_scaffolding\.py$"]
+        )
+        self.assertEqual(
+            DEFAULT_EXCLUDE_FRAME_PATHS,
+            original + [r"/my_internal_framework/", r"/fb_scaffolding\.py$"],
+        )
+
+        # Verify the appended pattern actually applies at session time.
+        user_frame = _make_frame("/app/main.py", "main", 1, {})
+        framework_frame = _make_frame(
+            "/opt/my_internal_framework/runner.py", "run", 42, {}
+        )
+        st = _make_stacktrace(
+            100, [user_frame, framework_frame], thread_name="MainThread"
+        )
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=801,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+        resp = _drain_messages(self.stream)[0]
+        hints = [f["presentationHint"] for f in resp["body"]["stackFrames"]]
+        self.assertEqual(hints, ["normal", "deemphasize"])
+
+    def test_extend_default_exclude_frame_paths_ignores_junk(self) -> None:
+        """Non-string / empty-string entries are dropped silently."""
+        original = self._saved_default_exclude
+        extend_default_exclude_frame_paths(
+            ["", None, 42, r"/real_pattern/"]  # pyre-ignore[6]
+        )
+        self.assertEqual(DEFAULT_EXCLUDE_FRAME_PATHS, original + [r"/real_pattern/"])
+
+    def test_set_default_exclude_frame_paths_replaces_wholesale(self) -> None:
+        """``set_default_exclude_frame_paths`` swaps the list in-place."""
+        set_default_exclude_frame_paths([r"/only_this/"])
+        self.assertEqual(DEFAULT_EXCLUDE_FRAME_PATHS, [r"/only_this/"])
+
+        # Previous patterns no longer apply — a pydevd frame now
+        # renders ``normal`` because we dropped the baseline.
+        pydevd_frame = _make_frame("/pydevd/pydevd.py", "do_wait_suspend", 1, {})
+        user_frame = _make_frame("/app/main.py", "main", 1, {})
+        st = _make_stacktrace(100, [user_frame, pydevd_frame], thread_name="MainThread")
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=802,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+        hints = [
+            f["presentationHint"]
+            for f in _drain_messages(self.stream)[0]["body"]["stackFrames"]
+        ]
+        self.assertEqual(hints, ["normal", "normal"])
 
 
 if __name__ == "__main__":
