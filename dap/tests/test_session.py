@@ -654,6 +654,243 @@ class SessionHandlerTest(unittest.TestCase):
         self.assertFalse(resp["success"])
         self.assertIn("int", resp.get("message", ""))
 
+    def test_attach_routes_through_launch_handler(self) -> None:
+        """An ``attach`` request should run the full launch flow.
+
+        Tintype sessions don't distinguish attach from launch — both
+        open the ``.pytb`` and emit the initial process/thread/stopped
+        events — so the dispatcher must wire ``attach`` to the same code
+        path as ``launch``.
+        """
+        frame = _make_frame("/a/b.py", "foo", 10, {"x": 1})
+        st = _make_stacktrace(100, [frame], thread_name="MainThread")
+        snap = _make_snapshot([st])
+
+        reader = MagicMock()
+        reader.snapshot_count.return_value = 1
+        reader.get_all_source_files.return_value = []
+        reader.get_all_snapshots.return_value = [snap]
+        reader.get_snapshot_at_index.side_effect = lambda i: snap if i == 0 else None
+
+        with (
+            patch("tintype.dap.session.SnapshotReader", return_value=reader),
+            patch("tintype.dap.session.os.path.isfile", return_value=True),
+        ):
+            _send_request(
+                self.session,
+                self.dispatcher,
+                seq=1,
+                command="attach",
+                arguments={"pytbPath": "/fake/snap.pytb"},
+            )
+
+        messages = _drain_messages(self.stream)
+        event_names = [m.get("event") for m in messages if m["type"] == "event"]
+        # Attach must produce the same initial event sequence as launch.
+        # (No ``process`` event — see test_launch_emits_initial_events for
+        # why we deliberately don't emit one.)
+        self.assertIn("initialized", event_names)
+        self.assertNotIn("process", event_names)
+        self.assertIn("thread", event_names)
+        self.assertIn("stopped", event_names)
+
+        # The attach response must succeed.
+        attach_resps = [
+            m
+            for m in messages
+            if m.get("type") == "response" and m.get("command") == "attach"
+        ]
+        self.assertEqual(len(attach_resps), 1)
+        self.assertTrue(attach_resps[0]["success"])
+
+    def test_restart_jumps_cursor_to_first_snapshot_and_re_emits_stopped(
+        self,
+    ) -> None:
+        """``restart`` must reset the cursor to snapshot #0 and re-emit stopped.
+
+        There's no runtime to restart in a snapshot session, so the
+        adapter reinterprets the DAP ``restart`` request as "jump back
+        to the first snapshot".
+        """
+        snap1 = _make_snapshot(
+            [_make_stacktrace(100, [_make_frame("/a/b.py", "foo", 1, {})])],
+            ts=1_700_000_000_000_000,
+        )
+        snap2 = _make_snapshot(
+            [_make_stacktrace(100, [_make_frame("/a/b.py", "foo", 2, {})])],
+            ts=1_700_000_005_000_000,
+        )
+        self._launch_with_snapshots([snap1, snap2])
+
+        # Advance past the first snapshot so restart has somewhere to jump back from.
+        _send_request(self.session, self.dispatcher, seq=100, command="continue")
+        # Internal state should reflect the cursor being on snapshot #2.
+        self.assertEqual(self.session._snapshot_index, 1)
+
+        # Restart should reset the cursor and re-emit stopped.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(self.session, self.dispatcher, seq=102, command="restart")
+
+        messages = _drain_messages(self.stream)
+        restart_resps = [
+            m
+            for m in messages
+            if m.get("type") == "response" and m.get("command") == "restart"
+        ]
+        self.assertEqual(len(restart_resps), 1)
+        self.assertTrue(restart_resps[0]["success"])
+
+        event_names = [m.get("event") for m in messages if m["type"] == "event"]
+        self.assertIn("stopped", event_names)
+        # Restart does NOT emit a ``process`` event — see
+        # test_launch_emits_initial_events for why we deliberately never
+        # emit one.
+        self.assertNotIn("process", event_names)
+
+        # Stopped event must NOT carry a ``description`` field (would
+        # leak into the CALL STACK session row and get stuck there).
+        stopped_events = [
+            m
+            for m in messages
+            if m.get("type") == "event" and m.get("event") == "stopped"
+        ]
+        self.assertEqual(len(stopped_events), 1)
+        self.assertNotIn("description", stopped_events[0]["body"])
+
+        # The cursor must now be back on snapshot #0.
+        self.assertEqual(self.session._snapshot_index, 0)
+        self.assertFalse(self.session.terminated)
+
+    def test_stopped_event_preserves_last_focused_thread_across_snapshots(
+        self,
+    ) -> None:
+        """After the user inspects a thread via stackTrace, subsequent
+        snapshot stops should re-focus a same-named thread.
+
+        The user's focus normally bounces to whichever thread has an
+        exception on every stop, which is jarring while navigating
+        through snapshots. We track the thread-name of the most recent
+        ``stackTrace`` request and prefer that name when picking the
+        threadId for the next ``stopped`` event.
+        """
+        # Snapshot 1: two threads, an exception in Worker.
+        main1 = _make_frame("/a/b.py", "main", 1, {})
+        worker1 = _make_frame("/a/b.py", "work", 1, {})
+        snap1 = _make_snapshot(
+            [
+                _make_stacktrace(100, [main1], thread_name="MainThread"),
+                _make_stacktrace(
+                    200, [worker1], thread_name="Worker", exception=ValueError("x")
+                ),
+            ],
+            ts=1_700_000_000_000_000,
+        )
+
+        # Snapshot 2: same two threads — both present, exception still in
+        # Worker. Without preservation, focus would snap back to Worker
+        # (exception-first fallback). With preservation, if the user
+        # last inspected MainThread, focus should stay on MainThread.
+        main2 = _make_frame("/a/b.py", "main", 2, {})
+        worker2 = _make_frame("/a/b.py", "work", 2, {})
+        snap2 = _make_snapshot(
+            [
+                _make_stacktrace(100, [main2], thread_name="MainThread"),
+                _make_stacktrace(
+                    200, [worker2], thread_name="Worker", exception=ValueError("x")
+                ),
+            ],
+            ts=1_700_000_005_000_000,
+        )
+
+        self._launch_with_snapshots([snap1, snap2])
+
+        # Initial stopped event should focus the exception thread
+        # (Worker, id=200) because no thread preference exists yet.
+        launch_messages = _drain_messages(self.stream)
+        launch_stopped = next(m for m in launch_messages if m.get("event") == "stopped")
+        self.assertEqual(launch_stopped["body"]["threadId"], 200)
+
+        # User clicks MainThread in the CALL STACK — VS Code issues
+        # stackTrace against that thread.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=100,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+
+        # Jump forward to snapshot 2. The preferred-thread logic should
+        # land focus on MainThread (id=100), not the exception thread.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(self.session, self.dispatcher, seq=101, command="continue")
+        jump_messages = _drain_messages(self.stream)
+        jump_stopped = next(m for m in jump_messages if m.get("event") == "stopped")
+        self.assertEqual(jump_stopped["body"]["threadId"], 100)
+
+    def test_stopped_event_falls_back_when_preferred_thread_vanishes(
+        self,
+    ) -> None:
+        """When the preferred thread isn't in the new snapshot, fall
+        back to exception-first — don't just pick the first thread
+        blindly."""
+        # Snapshot 1: two threads, Worker has an exception.
+        snap1 = _make_snapshot(
+            [
+                _make_stacktrace(
+                    100,
+                    [_make_frame("/a/b.py", "main", 1, {})],
+                    thread_name="MainThread",
+                ),
+                _make_stacktrace(
+                    200,
+                    [_make_frame("/a/b.py", "work", 1, {})],
+                    thread_name="Worker",
+                    exception=ValueError("boom"),
+                ),
+            ],
+            ts=1_700_000_000_000_000,
+        )
+        # Snapshot 2: the MainThread has disappeared (e.g. it exited).
+        # Only Worker remains, still with its exception.
+        snap2 = _make_snapshot(
+            [
+                _make_stacktrace(
+                    200,
+                    [_make_frame("/a/b.py", "work", 2, {})],
+                    thread_name="Worker",
+                    exception=ValueError("boom"),
+                ),
+            ],
+            ts=1_700_000_005_000_000,
+        )
+        self._launch_with_snapshots([snap1, snap2])
+
+        # User focuses MainThread.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=200,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+
+        # Advance past MainThread's disappearance; focus must fall back
+        # to the exception thread (Worker, 200), NOT to any first-in-map
+        # sentinel.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(self.session, self.dispatcher, seq=201, command="continue")
+        jump_messages = _drain_messages(self.stream)
+        jump_stopped = next(m for m in jump_messages if m.get("event") == "stopped")
+        self.assertEqual(jump_stopped["body"]["threadId"], 200)
+
 
 if __name__ == "__main__":
     unittest.main()
