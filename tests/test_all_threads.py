@@ -16,7 +16,7 @@ import unittest
 
 import tintype
 
-# Check if we're running in free-threaded Python (3.13t+)
+# Check if we're running in free-threaded Python (3.14t+)
 # snapshot_all_threads is disabled in free-threaded Python due to potential deadlocks
 IS_FREE_THREADED: bool = hasattr(sys, "_is_gil_enabled") and not sys._is_gil_enabled()
 

@@ -325,7 +325,7 @@ class SnapshotCapture {
    * Called by snapshotAllThreads() to capture all thread stacks.
    *
    * In standard Python, the GIL is held throughout, so other Python threads
-   * are paused and objects are stable. In free-threaded Python (3.13t+),
+   * are paused and objects are stable. In free-threaded Python (3.14t+),
    * other threads continue executing - we hold references to prevent object
    * destruction, but object state may be mutated during serialization.
    *
@@ -405,7 +405,7 @@ class SnapshotCapture {
    * Called from samplingLoop() with the GIL held. Uses sys._current_frames()
    * to directly capture the target thread's frame.
    *
-   * Note: In free-threaded Python (3.13t+), other threads continue executing
+   * Note: In free-threaded Python (3.14t+), other threads continue executing
    * even with GIL held - we hold references to prevent object destruction,
    * but object state may be mutated during serialization.
    */

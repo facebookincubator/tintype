@@ -17,7 +17,7 @@ import unittest
 import tintype
 from tintype._sampling import disable_sampling, enable_sampling, sampling, SamplingMode
 
-# Check if we're running in free-threaded Python (3.13t+)
+# Check if we're running in free-threaded Python (3.14t+)
 # Sampling is disabled in free-threaded Python due to potential deadlocks
 IS_FREE_THREADED: bool = hasattr(sys, "_is_gil_enabled") and not sys._is_gil_enabled()
 

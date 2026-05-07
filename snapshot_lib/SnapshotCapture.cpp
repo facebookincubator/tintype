@@ -98,7 +98,7 @@ std::vector<std::pair<std::string, uint64_t>> extractLocalVars(
     // py::reinterpret_borrow creates a py::object that borrows the reference,
     // but when pushed to processingQueue, the copy constructor INCREFs.
     // This ensures the object stays alive during serialization.
-    // Note: In free-threaded Python (3.13t+), other threads may continue
+    // Note: In free-threaded Python (3.14t+), other threads may continue
     // executing and could mutate objects, but they won't be destroyed while
     // we hold this reference.
     processingQueue.emplace_back(py::reinterpret_borrow<py::object>(value), 0);
@@ -2313,7 +2313,7 @@ void SnapshotCapture::sampleSingleThread(
     bool alreadyHoldsLock) {
   // Directly capture the target thread using sys._current_frames().
   // The GIL is held by samplingLoop() via PyGILState_Ensure().
-  // Note: In free-threaded Python (3.13t+), other threads continue executing
+  // Note: In free-threaded Python (3.14t+), other threads continue executing
   // even with GIL held - we hold references to prevent object destruction,
   // but object state may be mutated during serialization.
 
