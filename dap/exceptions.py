@@ -1,0 +1,213 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+# pyre-strict
+
+"""Build DAP ``ExceptionInfoResponse`` bodies from snapshot stacktraces.
+
+Walks the ``__cause__`` / ``__context__`` chain attached to a stacktrace
+and formats a single description string that mirrors what CPython would
+print via :func:`traceback.print_exception`.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+from typing import Any, TYPE_CHECKING
+
+from tintype import Stacktrace
+
+
+if TYPE_CHECKING:
+    from tintype.dap.sources import SourceRegistry
+
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+_CAUSE_MSG = "\nThe above exception was the direct cause of the following exception:\n"
+_CONTEXT_MSG = "\nDuring handling of the above exception, another exception occurred:\n"
+# Mirrors CPython's own cap in ``traceback.py`` so we never blow the stack
+# (or spin forever) on a cyclic / pathological chain.
+_MAX_CHAIN_DEPTH = 10
+
+
+def build_exception_info(
+    stacktrace: Stacktrace,
+    sources: SourceRegistry | None = None,
+) -> dict[str, Any] | None:
+    """Return a DAP ``ExceptionInfoResponse.body`` or ``None`` for non-exception stacktraces.
+
+    When ``sources`` is supplied we resolve source-line decorations via the
+    snapshot's embedded source registry (in-memory + extracted-dir). This is
+    preferred over a viewer-side ``linecache`` read because ``frame.file_path``
+    is captured on a potentially different machine — a viewer with a
+    same-named file at that path would otherwise surface its current
+    contents, which is misleading at best and an info-leak at worst.
+    """
+    if stacktrace.exception_object is None:
+        return None
+
+    type_name, message = _describe(stacktrace.exception_object)
+    details = {
+        "message": message,
+        "typeName": type_name,
+        "fullTypeName": type_name,
+        "stackTrace": _format_chain(stacktrace, sources),
+    }
+
+    return {
+        "exceptionId": type_name,
+        "description": message,
+        "breakMode": "unhandled",
+        "details": details,
+    }
+
+
+def _describe(exc: object) -> tuple[str, str]:
+    """Return ``(type_name, message)`` for a snapshot exception object.
+
+    Snapshot exceptions are :class:`~tintype.SerializedObject` instances —
+    the original exception class can't be reconstructed, so we derive the
+    name from ``type(exc).__name__`` with a best-effort lookup of the
+    serialized class name attribute when present.
+    """
+    # SerializedObject stores the original type's name as part of its repr
+    # (e.g. ``ValueError('boom')``). Prefer that over the literal
+    # ``SerializedObject`` class name.
+    serialized_cls = type(exc).__name__
+    type_name = serialized_cls
+
+    try:
+        rep = repr(exc)
+    except Exception:  # noqa: BLE001
+        rep = serialized_cls
+
+    # Heuristic: repr is typically ``TypeName(args...)``.
+    paren = rep.find("(")
+    if paren > 0:
+        candidate = rep[:paren].strip()
+        if candidate and candidate != serialized_cls:
+            type_name = candidate
+
+    message: str
+    try:
+        message = str(exc)
+    except Exception:  # noqa: BLE001
+        message = rep
+
+    return type_name, message
+
+
+def _format_chain(
+    stacktrace: Stacktrace,
+    sources: SourceRegistry | None,
+) -> str:
+    """Render the full cause/context chain as a multi-line string.
+
+    Guards against two failure modes:
+
+    * A cyclic chain (``a.__cause__ is b`` and ``b.__cause__ is a``) —
+      tracked via a ``seen`` set keyed on Python ``id()`` of each
+      stacktrace we render.
+    * A pathologically long chain — bounded by :data:`_MAX_CHAIN_DEPTH`
+      (matches CPython's own cap in ``traceback.py``).
+
+    When either guard fires we append an explicit truncation note so the
+    user knows the output is not a silent cut-off.
+    """
+    buf = io.StringIO()
+    _render_one(buf, stacktrace, sources)
+
+    seen: set[int] = {id(stacktrace)}
+    current: Stacktrace | None = stacktrace
+    depth = 0
+    while current is not None:
+        if depth >= _MAX_CHAIN_DEPTH:
+            buf.write(
+                f"\n[tintype] Truncated exception chain after {_MAX_CHAIN_DEPTH} frames.\n"
+            )
+            break
+
+        cause = current.get_cause()
+        if cause is not None:
+            if id(cause) in seen:
+                buf.write("\n[tintype] Exception chain loops back; truncating.\n")
+                break
+            seen.add(id(cause))
+            buf.write(_CAUSE_MSG)
+            _render_one(buf, cause, sources)
+            current = cause
+            depth += 1
+            continue
+
+        context = current.get_context()
+        if context is not None:
+            if id(context) in seen:
+                buf.write("\n[tintype] Exception chain loops back; truncating.\n")
+                break
+            seen.add(id(context))
+            buf.write(_CONTEXT_MSG)
+            _render_one(buf, context, sources)
+            current = context
+            depth += 1
+            continue
+
+        break
+
+    return buf.getvalue()
+
+
+def _source_line_from_registry(
+    sources: SourceRegistry | None,
+    file_path: str,
+    line_number: int,
+) -> str:
+    """Return the source line at ``line_number`` (1-based) from the registry.
+
+    Returns an empty string if the file is not embedded, the line number is
+    out of range, or ``sources`` is ``None``. Deliberately does **not** fall
+    back to reading the viewer's filesystem — ``frame.file_path`` is
+    captured on a different machine and may collide with an unrelated local
+    file.
+    """
+    if sources is None or not file_path or line_number <= 0:
+        return ""
+    content = sources.get_by_path(file_path)
+    if content is None:
+        return ""
+    lines = content.splitlines()
+    if line_number > len(lines):
+        return ""
+    return lines[line_number - 1]
+
+
+def _render_one(
+    out: io.StringIO,
+    stacktrace: Stacktrace,
+    sources: SourceRegistry | None,
+) -> None:
+    """Render a single stacktrace as ``Traceback (most recent call last):`` + frames."""
+    out.write("Traceback (most recent call last):\n")
+
+    # Frames in tintype are stored innermost-last (matching CPython traceback
+    # order after ``get_traceback`` reverses them). Mirror that order here.
+    for frame in stacktrace.frames:
+        out.write(f'  File "{frame.file_path}", line {frame.line_number}, ')
+        out.write(f"in {frame.function_name}\n")
+        # Resolve the source line through the snapshot's embedded source
+        # registry (NOT via ``linecache`` on the viewer's filesystem — see
+        # the docstring on ``build_exception_info`` for why).
+        line = _source_line_from_registry(sources, frame.file_path, frame.line_number)
+        if line:
+            out.write(f"    {line.strip()}\n")
+
+    exc = stacktrace.exception_object
+    if exc is not None:
+        type_name, message = _describe(exc)
+        if message:
+            out.write(f"{type_name}: {message}\n")
+        else:
+            out.write(f"{type_name}\n")
