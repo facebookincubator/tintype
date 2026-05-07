@@ -98,6 +98,9 @@ class SnapshotDebugSession:
                 "terminate": self.handle_terminate,
                 "setExceptionBreakpoints": self.handle_set_exception_breakpoints,
                 "setBreakpoints": self.handle_set_breakpoints,
+                # Custom tintype requests for the sidebar UI.
+                "tintypeSnapshotList": self.handle_tintype_snapshot_list,
+                "tintypeJumpToSnapshot": self.handle_tintype_jump_to_snapshot,
             }
         )
 
@@ -400,13 +403,36 @@ class SnapshotDebugSession:
     def handle_tintype_snapshot_list(
         self, _arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        """Return all snapshot entries + current cursor for the sidebar."""
+        """Return all snapshot entries + current cursor for the sidebar.
+
+        Entries whose snapshot fails to load are still emitted (with
+        ``corrupt: true`` and no timestamp) so the sidebar's row count
+        matches ``reader.snapshot_count()`` and the user sees *why* some
+        rows are sparse. Also emits a DAP ``output`` event per corrupt
+        entry so the debug console carries the diagnostic.
+        """
         reader = self._require_reader()
         total = reader.snapshot_count()
         entries: list[dict[str, Any]] = []
         for index in range(total):
             snap = reader.get_snapshot_at_index(index)
             if snap is None:
+                logger.warning(
+                    "snapshot at index %d could not be loaded; marking corrupt",
+                    index,
+                )
+                self._dispatcher.send_event(
+                    "output",
+                    body={
+                        "category": "important",
+                        "output": (
+                            f"tintype: snapshot {index} could not be loaded "
+                            f"(corrupt or unreadable); the sidebar will show "
+                            f"it as unavailable.\n"
+                        ),
+                    },
+                )
+                entries.append({"index": index, "corrupt": True})
                 continue
             entries.append(
                 {
@@ -442,7 +468,16 @@ class SnapshotDebugSession:
         self._load_snapshot(raw_index)
         self._reconcile_thread_events(old_threads)
         self._send_stopped_event()
-        return {"index": raw_index}
+        # Include ``currentIndex`` + ``totalSnapshots`` alongside the old
+        # ``index`` field so the client can update the sidebar's cursor /
+        # total without a follow-up ``tintypeSnapshotList`` round-trip.
+        # ``index`` is kept for backward compatibility with callers that
+        # haven't been updated yet.
+        return {
+            "index": raw_index,
+            "currentIndex": raw_index,
+            "totalSnapshots": reader.snapshot_count(),
+        }
 
     # ---------------------------------------------------------------
     # Snapshot navigation internals

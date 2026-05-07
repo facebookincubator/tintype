@@ -511,6 +511,149 @@ class SessionHandlerTest(unittest.TestCase):
         ]
         self.assertEqual(first_ids, second_ids)
 
+    # --- Frame ordering regression ---------------------------------
+
+    def test_stack_trace_frame_order_innermost_first(self) -> None:
+        """DAP expects frame[0] to be the innermost (most recently called)
+        frame. Tintype stores frames innermost-first, so the session must
+        NOT reverse them."""
+        inner = _make_frame("/app/inner.py", "inner_fn", 100, {})
+        middle = _make_frame("/app/middle.py", "middle_fn", 50, {})
+        outer = _make_frame("/app/outer.py", "main", 10, {})
+        # Tintype layout: innermost-first.
+        st = _make_stacktrace(42, [inner, middle, outer], thread_name="T")
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=500,
+            command="stackTrace",
+            arguments={"threadId": 42},
+        )
+        resp = _drain_messages(self.stream)[0]
+        self.assertTrue(resp["success"])
+        names = [f["name"] for f in resp["body"]["stackFrames"]]
+        # DAP expects innermost at the top.
+        self.assertEqual(names, ["inner_fn", "middle_fn", "main"])
+
+    # --- Custom tintype requests (sidebar UI) -----------------------
+
+    def _first_two_snapshot_launch(self) -> None:
+        frame1 = _make_frame("/a.py", "foo", 10, {"x": 1})
+        st1 = _make_stacktrace(100, [frame1], thread_name="MainThread")
+        snap1 = _make_snapshot([st1], ts=1_700_000_000_000_000)
+
+        frame2 = _make_frame("/a.py", "bar", 20, {"y": 2})
+        st2 = _make_stacktrace(100, [frame2], thread_name="MainThread")
+        snap2 = _make_snapshot([st2], ts=1_700_000_001_000_000)
+        self._launch_with_snapshots([snap1, snap2])
+
+    def test_tintype_snapshot_list_returns_all_entries(self) -> None:
+        self._first_two_snapshot_launch()
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session, self.dispatcher, seq=200, command="tintypeSnapshotList"
+        )
+        resp = _drain_messages(self.stream)[0]
+        self.assertTrue(resp["success"])
+        body = resp["body"]
+        self.assertEqual(body["currentIndex"], 0)
+        self.assertEqual(len(body["snapshots"]), 2)
+        self.assertEqual(
+            body["snapshots"][0], {"index": 0, "timestampUs": 1_700_000_000_000_000}
+        )
+        self.assertEqual(
+            body["snapshots"][1], {"index": 1, "timestampUs": 1_700_000_001_000_000}
+        )
+
+    def test_tintype_jump_advances_cursor_and_emits_stopped(self) -> None:
+        self._first_two_snapshot_launch()
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=201,
+            command="tintypeJumpToSnapshot",
+            arguments={"index": 1},
+        )
+        messages = _drain_messages(self.stream)
+        # Expect at least one response with success=true and a stopped event.
+        resp = [m for m in messages if m.get("type") == "response"][0]
+        self.assertTrue(resp["success"])
+        # Response carries the new index + total alongside the legacy
+        # ``index`` field so the client can update the sidebar's cursor
+        # and length without a follow-up tintypeSnapshotList round-trip.
+        self.assertEqual(resp["body"]["index"], 1)
+        self.assertEqual(resp["body"]["currentIndex"], 1)
+        self.assertEqual(resp["body"]["totalSnapshots"], 2)
+
+        stopped = [m for m in messages if m.get("event") == "stopped"]
+        self.assertEqual(len(stopped), 1)
+
+        # Following list should report the new current index.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session, self.dispatcher, seq=202, command="tintypeSnapshotList"
+        )
+        list_resp = _drain_messages(self.stream)[0]
+        self.assertEqual(list_resp["body"]["currentIndex"], 1)
+
+    def test_tintype_jump_rejects_missing_index(self) -> None:
+        self._first_two_snapshot_launch()
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=203,
+            command="tintypeJumpToSnapshot",
+            arguments={},
+        )
+        resp = _drain_messages(self.stream)[0]
+        self.assertFalse(resp["success"])
+        self.assertIn("index", resp.get("message", ""))
+
+    def test_tintype_jump_rejects_out_of_range_index(self) -> None:
+        self._first_two_snapshot_launch()
+        for bad in (-1, 2, 99):
+            with self.subTest(index=bad):
+                self.stream.seek(0)
+                self.stream.truncate()
+                _send_request(
+                    self.session,
+                    self.dispatcher,
+                    seq=300 + bad,
+                    command="tintypeJumpToSnapshot",
+                    arguments={"index": bad},
+                )
+                resp = _drain_messages(self.stream)[0]
+                self.assertFalse(resp["success"])
+                self.assertIn("out of range", resp.get("message", ""))
+
+    def test_tintype_jump_rejects_non_integer_index(self) -> None:
+        self._first_two_snapshot_launch()
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=400,
+            command="tintypeJumpToSnapshot",
+            arguments={"index": "not-a-number"},
+        )
+        resp = _drain_messages(self.stream)[0]
+        self.assertFalse(resp["success"])
+        self.assertIn("int", resp.get("message", ""))
+
 
 if __name__ == "__main__":
     unittest.main()
