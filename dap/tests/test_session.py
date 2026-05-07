@@ -855,11 +855,13 @@ class SessionHandlerTest(unittest.TestCase):
 
         self._launch_with_snapshots([snap1, snap2])
 
-        # Initial stopped event should focus the exception thread
-        # (Worker, id=200) because no thread preference exists yet.
+        # Initial stopped event should focus the virtual exception-chain
+        # thread (id=-1, the new synthetic entry that flattens all
+        # exception stacktraces into a single CALL STACK row) because
+        # no thread preference exists yet.
         launch_messages = _drain_messages(self.stream)
         launch_stopped = next(m for m in launch_messages if m.get("event") == "stopped")
-        self.assertEqual(launch_stopped["body"]["threadId"], 200)
+        self.assertEqual(launch_stopped["body"]["threadId"], -1)
 
         # User clicks MainThread in the CALL STACK — VS Code issues
         # stackTrace against that thread.
@@ -932,14 +934,15 @@ class SessionHandlerTest(unittest.TestCase):
         )
 
         # Advance past MainThread's disappearance; focus must fall back
-        # to the exception thread (Worker, 200), NOT to any first-in-map
-        # sentinel.
+        # to the virtual exception-chain thread (-1), NOT to any
+        # first-in-map sentinel — the snapshot has an exception, so
+        # the chain view is the natural landing spot.
         self.stream.seek(0)
         self.stream.truncate()
         _send_request(self.session, self.dispatcher, seq=201, command="continue")
         jump_messages = _drain_messages(self.stream)
         jump_stopped = next(m for m in jump_messages if m.get("event") == "stopped")
-        self.assertEqual(jump_stopped["body"]["threadId"], 200)
+        self.assertEqual(jump_stopped["body"]["threadId"], -1)
 
     def test_default_filter_deemphasizes_pydevd_debugpy_frames(self) -> None:
         """Out of the box, pydevd/debugpy frames should be deemphasized."""
@@ -985,8 +988,8 @@ class SessionHandlerTest(unittest.TestCase):
         # ``deemphasize``.
         hints = [f["presentationHint"] for f in frames]
         self.assertEqual(hints[0], "normal")
-        self.assertEqual(hints[1], "deemphasize")
-        self.assertEqual(hints[2], "deemphasize")
+        self.assertEqual(hints[1], "subtle")
+        self.assertEqual(hints[2], "subtle")
 
     def test_hide_filtered_frames_drops_them_from_stack(self) -> None:
         """``hideFilteredFrames: true`` removes matching frames entirely."""
@@ -1088,7 +1091,7 @@ class SessionHandlerTest(unittest.TestCase):
         # Other pydevd frame: deemphasize.
         self.assertEqual(hints[0], "normal")
         self.assertEqual(hints[1], "normal")
-        self.assertEqual(hints[2], "deemphasize")
+        self.assertEqual(hints[2], "subtle")
 
     def test_pydevd_only_thread_is_omitted_from_threads_response(self) -> None:
         """Threads consisting entirely of filtered frames are dropped."""
@@ -1254,7 +1257,7 @@ class SessionHandlerTest(unittest.TestCase):
         frames = resp["body"]["stackFrames"]
         self.assertEqual(
             [f["presentationHint"] for f in frames],
-            ["normal", "deemphasize", "deemphasize"],
+            ["normal", "subtle", "subtle"],
         )
 
     def test_default_filter_deemphasizes_queue_frames(self) -> None:
@@ -1278,7 +1281,7 @@ class SessionHandlerTest(unittest.TestCase):
         frames = resp["body"]["stackFrames"]
         self.assertEqual(
             [f["presentationHint"] for f in frames],
-            ["normal", "deemphasize"],
+            ["normal", "subtle"],
         )
 
     def test_default_filter_deemphasizes_string_exec_frames(self) -> None:
@@ -1334,7 +1337,7 @@ class SessionHandlerTest(unittest.TestCase):
         frames = resp["body"]["stackFrames"]
         self.assertEqual(
             [f["presentationHint"] for f in frames],
-            ["normal", "normal", "deemphasize", "normal"],
+            ["normal", "normal", "subtle", "normal"],
         )
 
     def test_extend_default_exclude_frame_paths_appends_additively(self) -> None:
@@ -1370,7 +1373,7 @@ class SessionHandlerTest(unittest.TestCase):
         )
         resp = _drain_messages(self.stream)[0]
         hints = [f["presentationHint"] for f in resp["body"]["stackFrames"]]
-        self.assertEqual(hints, ["normal", "deemphasize"])
+        self.assertEqual(hints, ["normal", "subtle"])
 
     def test_extend_default_exclude_frame_paths_ignores_junk(self) -> None:
         """Non-string / empty-string entries are dropped silently."""
@@ -1407,6 +1410,319 @@ class SessionHandlerTest(unittest.TestCase):
             for f in _drain_messages(self.stream)[0]["body"]["stackFrames"]
         ]
         self.assertEqual(hints, ["normal", "normal"])
+
+    # ---------------------------------------------------------------
+    # Exception-snapshot rendering (flat chain + stopped.text +
+    # innerException + label separators).
+    # ---------------------------------------------------------------
+
+    def test_exception_snapshot_emits_virtual_chain_thread(self) -> None:
+        """A snapshot with a single exception stacktrace surfaces as one
+        virtual ``Exception: ...`` thread — not a ``Thread N`` row —
+        and the original exception stacktrace is hidden from the
+        threads list (its frames are already in the chain view).
+        """
+        outer_exc = ValueError("outer boom")
+        outer_st = _make_stacktrace(
+            200,
+            [_make_frame("/a/b.py", "raiser", 10, {})],
+            thread_name="Worker",
+            exception=outer_exc,
+        )
+        main_st = _make_stacktrace(
+            100,
+            [_make_frame("/a/b.py", "main", 1, {})],
+            thread_name="MainThread",
+        )
+        snap = _make_snapshot([outer_st, main_st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(self.session, self.dispatcher, seq=500, command="threads")
+        threads = _drain_messages(self.stream)[0]["body"]["threads"]
+
+        ids = [t["id"] for t in threads]
+        # Virtual chain row replaces the exception thread; the real
+        # non-exception thread (MainThread) survives.
+        self.assertIn(-1, ids)
+        self.assertIn(100, ids)
+        self.assertNotIn(200, ids)
+
+        chain_row = next(t for t in threads if t["id"] == -1)
+        # Label carries the exception type + message and has no
+        # ``Thread`` prefix.
+        self.assertIn("Exception:", chain_row["name"])
+        self.assertIn("ValueError", chain_row["name"])
+        self.assertIn("outer boom", chain_row["name"])
+        self.assertNotIn("Thread", chain_row["name"])
+
+    def test_exception_snapshot_chain_stack_inserts_separator_frames(self) -> None:
+        """``stackTrace`` on the virtual chain thread returns a flattened
+        frame list in CPython ``traceback.print_exception`` order —
+        **innermost cause first**, separator, then outer effect — with
+        ``presentationHint: "label"`` separator frames between groups.
+        Arrow-separator text is ``⬆ CAUSED BY ⬆`` for ``__cause__``
+        chains and ``⬆ DURING HANDLING OF ⬆`` for ``__context__``
+        chains, pointing up at the cause that was just rendered.
+        """
+        # Build a two-level chain: outer.__cause__ = cause_st.
+        cause_exc = TypeError("inner")
+        cause_st = _make_stacktrace(
+            300,
+            [_make_frame("/a/b.py", "origin", 5, {})],
+            thread_name="Worker",
+            exception=cause_exc,
+        )
+        outer_exc = ValueError("outer")
+        outer_st = _make_stacktrace(
+            200,
+            [_make_frame("/a/b.py", "raiser", 10, {})],
+            thread_name="Worker",
+            exception=outer_exc,
+        )
+        # Wire the chain: outer.__cause__ = cause_st (cause_st has no
+        # further cause/context).
+        outer_st.get_cause.return_value = cause_st
+        cause_st.get_cause.return_value = None
+        cause_st.get_context.return_value = None
+
+        snap = _make_snapshot([outer_st, cause_st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=501,
+            command="stackTrace",
+            arguments={"threadId": -1},
+        )
+        frames = _drain_messages(self.stream)[0]["body"]["stackFrames"]
+        # Innermost cause frame (top of panel) → separator → outer
+        # effect frame (bottom) — CPython traceback order.
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(frames[0]["name"], "origin")
+        self.assertEqual(frames[0]["presentationHint"], "normal")
+        self.assertEqual(frames[1]["name"], "⬆ CAUSED BY ⬆")
+        self.assertEqual(frames[1]["presentationHint"], "label")
+        # Separator carries no source / no navigable line.
+        self.assertNotIn("source", frames[1])
+        self.assertEqual(frames[1]["line"], 0)
+        self.assertEqual(frames[2]["name"], "raiser")
+
+    def test_exception_snapshot_chain_uses_context_separator_when_no_cause(
+        self,
+    ) -> None:
+        """When ``__cause__`` is absent but ``__context__`` chains
+        through another exception, the separator reads
+        ``⬆ DURING HANDLING OF ⬆``.
+        """
+        ctx_exc = TypeError("context")
+        ctx_st = _make_stacktrace(
+            300,
+            [_make_frame("/a/b.py", "origin", 5, {})],
+            exception=ctx_exc,
+        )
+        outer_exc = ValueError("outer")
+        outer_st = _make_stacktrace(
+            200,
+            [_make_frame("/a/b.py", "raiser", 10, {})],
+            exception=outer_exc,
+        )
+        outer_st.get_cause.return_value = None
+        outer_st.get_context.return_value = ctx_st
+
+        snap = _make_snapshot([outer_st, ctx_st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=502,
+            command="stackTrace",
+            arguments={"threadId": -1},
+        )
+        frames = _drain_messages(self.stream)[0]["body"]["stackFrames"]
+        self.assertEqual(frames[1]["name"], "⬆ DURING HANDLING OF ⬆")
+        self.assertEqual(frames[1]["presentationHint"], "label")
+
+    def test_exception_snapshot_stopped_event_sets_text_overlay(self) -> None:
+        """``stopped.text`` carries ``<ExcType>: <message>`` so VS Code
+        can render the red "Exception has occurred" overlay + hover on
+        the offending frame's source line.
+        """
+        exc = KeyError("missing")
+        st = _make_stacktrace(
+            200,
+            [_make_frame("/a/b.py", "raiser", 10, {})],
+            exception=exc,
+        )
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        messages = _drain_messages(self.stream)
+        stopped = next(m for m in messages if m.get("event") == "stopped")
+        self.assertEqual(stopped["body"]["reason"], "exception")
+        self.assertIn("text", stopped["body"])
+        self.assertIn("KeyError", stopped["body"]["text"])
+        self.assertIn("missing", stopped["body"]["text"])
+
+    def test_non_exception_snapshot_omits_text_overlay(self) -> None:
+        """No ``stopped.text`` for ordinary (non-exception) snapshots —
+        VS Code has nothing to decorate the frame with.
+        """
+        st = _make_stacktrace(
+            100,
+            [_make_frame("/a/b.py", "main", 1, {})],
+            thread_name="MainThread",
+        )
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        messages = _drain_messages(self.stream)
+        stopped = next(m for m in messages if m.get("event") == "stopped")
+        self.assertEqual(stopped["body"]["reason"], "pause")
+        self.assertNotIn("text", stopped["body"])
+
+    def test_exception_chain_stopped_text_comes_from_innermost_cause(
+        self,
+    ) -> None:
+        """VS Code anchors ``stopped.text`` on the **top** stack frame.
+        Under the flattened chain view that top frame is the innermost
+        cause's innermost frame (see
+        ``_build_exception_chain_stack_trace`` — chain is emitted
+        cause-first). So ``stopped.text`` must carry the innermost
+        cause's ``<ExcType>: <message>``, not the outer / final
+        effect's; otherwise the red hover labels the cause's raise
+        site with the effect's message.
+        """
+        cause_exc = TypeError("inner-cause-message")
+        cause_st = _make_stacktrace(
+            300,
+            [_make_frame("/a/b.py", "origin", 5, {})],
+            exception=cause_exc,
+        )
+        outer_exc = ValueError("outer-effect-message")
+        outer_st = _make_stacktrace(
+            200,
+            [_make_frame("/a/b.py", "raiser", 10, {})],
+            exception=outer_exc,
+        )
+        outer_st.get_cause.return_value = cause_st
+        snap = _make_snapshot([outer_st, cause_st])
+        self._launch_with_snapshots([snap])
+
+        messages = _drain_messages(self.stream)
+        stopped = next(m for m in messages if m.get("event") == "stopped")
+        self.assertEqual(stopped["body"]["reason"], "exception")
+        text = stopped["body"]["text"]
+        self.assertIn("TypeError", text)
+        self.assertIn("inner-cause-message", text)
+        # Explicitly NOT the outer exception's text — guards against a
+        # regression to sourcing from ``_pick_exception_chain_root``.
+        self.assertNotIn("ValueError", text)
+        self.assertNotIn("outer-effect-message", text)
+
+    def test_exception_chain_scopes_request_on_separator_frame_is_empty(
+        self,
+    ) -> None:
+        """``scopes`` on a separator frame must return an empty list,
+        not raise — VS Code issues it when the user focuses the
+        label row in CALL STACK.
+        """
+        cause_st = _make_stacktrace(
+            300, [_make_frame("/a/b.py", "origin", 5, {})], exception=TypeError("c")
+        )
+        outer_st = _make_stacktrace(
+            200, [_make_frame("/a/b.py", "raiser", 10, {})], exception=ValueError("o")
+        )
+        outer_st.get_cause.return_value = cause_st
+        snap = _make_snapshot([outer_st, cause_st])
+        self._launch_with_snapshots([snap])
+
+        # Build the chain first so separator frame_ids are allocated.
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=503,
+            command="stackTrace",
+            arguments={"threadId": -1},
+        )
+        frames = _drain_messages(self.stream)[0]["body"]["stackFrames"]
+        separator_id = next(f["id"] for f in frames if f["presentationHint"] == "label")
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=504,
+            command="scopes",
+            arguments={"frameId": separator_id},
+        )
+        response = _drain_messages(self.stream)[0]
+        self.assertTrue(response["success"])
+        self.assertEqual(response["body"]["scopes"], [])
+
+    def test_exception_info_on_virtual_chain_thread_returns_innermost_cause(
+        self,
+    ) -> None:
+        """``exceptionInfo(threadId=-1)`` routes to the innermost
+        (original cause) exception, NOT the outer / chain root.
+
+        VS Code uses the ``exceptionId`` / ``description`` fields from
+        this response to paint the red "Exception has occurred"
+        decoration anchored on the top stack frame, which under the
+        flattened chain view is the innermost cause's innermost
+        frame. Surfacing the outer exception's info here would
+        mislabel the cause's raise site with the effect's message.
+
+        ``innerException`` is naturally empty from the innermost (it
+        has no further ``__cause__`` / ``__context__``); the outer
+        exception's info remains visible via the flattened CALL
+        STACK rows, which carry both exceptions' frames.
+        """
+        cause_exc = TypeError("inner-cause")
+        cause_st = _make_stacktrace(
+            300, [_make_frame("/a/b.py", "origin", 5, {})], exception=cause_exc
+        )
+        outer_exc = ValueError("outer-raised")
+        outer_st = _make_stacktrace(
+            200, [_make_frame("/a/b.py", "raiser", 10, {})], exception=outer_exc
+        )
+        outer_st.get_cause.return_value = cause_st
+        snap = _make_snapshot([outer_st, cause_st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=505,
+            command="exceptionInfo",
+            arguments={"threadId": -1},
+        )
+        body = _drain_messages(self.stream)[0]["body"]
+        # Top-level reflects the innermost — this is what drives
+        # VS Code's red-overlay decoration.
+        self.assertIn("TypeError", body["exceptionId"])
+        self.assertEqual(body["description"], "inner-cause")
+        # Regression guard: the outer exception's info must NOT
+        # surface in the top-level fields.
+        self.assertNotIn("ValueError", body["exceptionId"])
+        self.assertNotIn("outer-raised", body["description"])
+        details = body["details"]
+        self.assertIn("TypeError", details["typeName"])
+        self.assertEqual(details["message"], "inner-cause")
+        # No further inner exception from the innermost.
+        self.assertNotIn("innerException", details)
 
 
 class StoppedEventDescriptionTest(unittest.TestCase):

@@ -46,24 +46,88 @@ def build_exception_info(
     is captured on a potentially different machine — a viewer with a
     same-named file at that path would otherwise surface its current
     contents, which is misleading at best and an info-leak at worst.
+
+    The response's ``details`` object carries two representations of the
+    cause/context chain:
+
+    * ``details.stackTrace`` — a pre-rendered CPython-style multi-line
+      string for clients that show the raw traceback as-is.
+    * ``details.innerException`` — a DAP-standard nested array of
+      :class:`ExceptionDetails` objects, one per chained exception,
+      produced via :func:`_build_details`. This lets DAP clients (e.g.
+      VS Code's Exception panel) render the chain as an expandable tree
+      rather than a single blob of text. The outermost (first raised)
+      exception is the top-level ``details``; each ``innerException``
+      entry is what caused (or was being handled when) the level above
+      it was raised. Chain traversal honours ``__cause__`` first, then
+      ``__context__``, mirroring CPython's ``traceback.print_exception``.
     """
     if stacktrace.exception_object is None:
         return None
 
-    type_name, message = _describe(stacktrace.exception_object)
-    details = {
-        "message": message,
-        "typeName": type_name,
-        "fullTypeName": type_name,
-        "stackTrace": _format_chain(stacktrace, sources),
-    }
+    details = _build_details(stacktrace, depth=0, seen={id(stacktrace)})
+    # ``stackTrace`` (the pre-rendered string) sits at the top level for
+    # clients that ignore ``innerException``. Source-line decoration
+    # lives there — ``_build_details`` itself is type/message-only.
+    details["stackTrace"] = _format_chain(stacktrace, sources)
 
+    type_name = details.get("typeName", "")
+    message = details.get("message", "")
     return {
         "exceptionId": type_name,
         "description": message,
         "breakMode": "unhandled",
         "details": details,
     }
+
+
+def _build_details(
+    stacktrace: Stacktrace,
+    *,
+    depth: int,
+    seen: set[int],
+) -> dict[str, Any]:
+    """Build a DAP ``ExceptionDetails`` node for ``stacktrace``, with
+    any cause/context chain nested under ``innerException``.
+
+    The chain walk mirrors :func:`_format_chain`'s guards:
+
+    * Cycles are detected via the ``seen`` set of Python ``id()``s
+      passed through the recursion.
+    * Depth is capped at :data:`_MAX_CHAIN_DEPTH`.
+
+    Inner nodes do **not** duplicate the pre-rendered ``stackTrace``
+    string — that's only set on the top-level details in
+    :func:`build_exception_info` to avoid exponential blowup of
+    redundant text on deeply chained exceptions. Because source-line
+    lookup only matters for the pre-rendered ``stackTrace``, this
+    function does not need a :class:`SourceRegistry`.
+    """
+    exc = stacktrace.exception_object
+    type_name, message = _describe(exc) if exc is not None else ("", "")
+    node: dict[str, Any] = {
+        "message": message,
+        "typeName": type_name,
+        "fullTypeName": type_name,
+    }
+    if depth >= _MAX_CHAIN_DEPTH:
+        return node
+
+    # Prefer ``__cause__`` (``raise X from Y``) over ``__context__``
+    # (implicit during-handling chain), matching CPython's own
+    # precedence in ``traceback.print_exception``.
+    next_stacktrace: Stacktrace | None = stacktrace.get_cause()
+    if next_stacktrace is None:
+        next_stacktrace = stacktrace.get_context()
+    if next_stacktrace is None:
+        return node
+    if id(next_stacktrace) in seen:
+        return node
+    seen.add(id(next_stacktrace))
+    node["innerException"] = [
+        _build_details(next_stacktrace, depth=depth + 1, seen=seen)
+    ]
+    return node
 
 
 def _describe(exc: object) -> tuple[str, str]:

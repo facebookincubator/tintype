@@ -31,6 +31,30 @@ from tintype.dap.variables import expand, make_variable, VariableRegistry
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+# Synthetic "thread" ID used by ``handle_threads`` / ``handle_stack_trace``
+# to represent a flattened exception chain as a single CALL STACK entry.
+# Real ``Stacktrace.id`` values are positive OS thread IDs, and DAP
+# reserves ``0`` for "no thread", so a fixed negative ID is guaranteed
+# not to collide. The value is an internal identifier — DAP clients see
+# it only as an opaque integer.
+_EXCEPTION_CHAIN_THREAD_ID = -1
+
+# Separator frame labels. Rendered with ``presentationHint: "label"``
+# so VS Code displays them as non-navigable headers between the frames
+# of chained exceptions in the CALL STACK panel. The arrows point
+# upward (toward the preceding frames) because in VS Code's CALL STACK
+# frame[0] is the top (innermost) and the separator sits *below* the
+# exception whose cause/context is about to be shown.
+_SEPARATOR_LABEL_CAUSE = "⬆ CAUSED BY ⬆"
+_SEPARATOR_LABEL_CONTEXT = "⬆ DURING HANDLING OF ⬆"
+
+# Cap on how far we follow ``__cause__`` / ``__context__`` when
+# flattening. Mirrors the matching cap in
+# :data:`tintype.dap.exceptions._MAX_CHAIN_DEPTH` so the two renderers
+# agree on what constitutes a pathological chain.
+_MAX_EXCEPTION_CHAIN_DEPTH = 10
+
+
 # Frame-path patterns (regex, matched against ``frame.file_path`` with
 # ``re.search``) whose frames are treated as "framework noise" by
 # default. Debugger-injected frames from pydevd/debugpy dominate the
@@ -148,6 +172,12 @@ class SnapshotDebugSession:
         # requests (VS Code re-issues them when refocusing) return the same
         # reference instead of accumulating stale ones.
         self._frame_scopes: dict[int, int] = {}
+        # Separator "label" frames used in the flattened exception-chain
+        # CALL STACK view. Maps frame_id -> human-readable label (e.g.
+        # ``"⬆ CAUSED BY ⬆"``). Parallel to ``_frames`` rather than merged
+        # into it because the lookup paths differ (separator frames have
+        # no source / no scopes / no stacktrace).
+        self._separator_frames: dict[int, str] = {}
 
         self._variables: VariableRegistry = VariableRegistry()
         self._sources: SourceRegistry = SourceRegistry()
@@ -416,8 +446,35 @@ class SnapshotDebugSession:
     def handle_threads(self, _arguments: dict[str, Any]) -> dict[str, Any]:
         snapshot = self._require_snapshot()
         threads: list[dict[str, Any]] = []
+
+        # When the snapshot carries any exception-bearing stacktraces,
+        # collapse them into a single synthetic "Exception: …" entry
+        # that presents a flattened ``__cause__`` / ``__context__``
+        # chain in the CALL STACK panel (see ``handle_stack_trace``).
+        # The individual exception stacktraces are hidden from the
+        # threads list because their frames are already surfaced via
+        # the virtual chain view — showing them twice would be noise.
+        exception_sts = [
+            st
+            for st in snapshot.stacktraces.values()
+            if st.exception_object is not None and not self._is_filtered_thread(st)
+        ]
+        chain_root = _pick_exception_chain_root(
+            snapshot, is_filtered=self._is_filtered_thread
+        )
+        if chain_root is not None:
+            threads.append(
+                {
+                    "id": _EXCEPTION_CHAIN_THREAD_ID,
+                    "name": _describe_exception_chain(chain_root),
+                }
+            )
+        exception_ids: set[int] = {int(st.id) for st in exception_sts}
+
         for stacktrace in snapshot.stacktraces.values():
             if self._is_filtered_thread(stacktrace):
+                continue
+            if int(stacktrace.id) in exception_ids:
                 continue
             threads.append(
                 {
@@ -432,6 +489,21 @@ class SnapshotDebugSession:
         thread_id = int(arguments.get("threadId", 0))
         start_frame = int(arguments.get("startFrame") or 0)
         levels = int(arguments.get("levels") or 0)
+
+        if thread_id == _EXCEPTION_CHAIN_THREAD_ID:
+            chain_root = _pick_exception_chain_root(
+                snapshot, is_filtered=self._is_filtered_thread
+            )
+            if chain_root is None:
+                raise DispatchError(
+                    "virtual exception-chain thread has no exception stacktraces"
+                )
+            # Remember the virtual thread as the user's preferred thread
+            # so exception-chain focus persists across snapshot jumps.
+            self._preferred_thread_name = _EXCEPTION_CHAIN_PREFERRED_NAME
+            return self._build_exception_chain_stack_trace(
+                chain_root, start_frame=start_frame, levels=levels
+            )
 
         stacktrace = snapshot.stacktraces.get(thread_id)
         if stacktrace is None:
@@ -473,8 +545,159 @@ class SnapshotDebugSession:
 
         return {"stackFrames": dap_frames, "totalFrames": total}
 
+    def _build_exception_chain_stack_trace(
+        self,
+        chain_root: Stacktrace,
+        *,
+        start_frame: int,
+        levels: int,
+    ) -> dict[str, Any]:
+        """Build the DAP ``stackTrace`` body for the virtual chain thread.
+
+        Walks ``chain_root`` → ``__cause__`` (preferred) → ``__context__``
+        exactly once per chain hop, bounded by
+        :data:`_MAX_EXCEPTION_CHAIN_DEPTH` and cycle-guarded via an
+        ``id()`` seen-set. The collected chain is then emitted in
+        **innermost-first** order (matching CPython's
+        ``traceback.print_exception`` layout) with separator "label"
+        frames between groups. Reading the panel top-down:
+
+        * frames of the original cause (oldest exception)
+        * separator (``⬆ CAUSED BY ⬆`` or ``⬆ DURING HANDLING OF ⬆``
+          — arrows point up at the cause that was just rendered)
+        * frames of the exception it caused
+        * …repeat until the outermost (most recently raised)…
+
+        Within each group, frames are innermost-first per DAP
+        convention (``frame[0]`` is the active frame). Separator
+        frames are registered in ``_separator_frames`` so the frame
+        IDs we hand out can be looked up on subsequent
+        ``scopes`` / ``source`` requests without any additional
+        bookkeeping path.
+        """
+        # First pass: walk from the outermost chain root inward,
+        # collecting each Stacktrace and recording how we reached it
+        # (via ``__cause__`` → ``_SEPARATOR_LABEL_CAUSE``, via
+        # ``__context__`` → ``_SEPARATOR_LABEL_CONTEXT``, or ``None``
+        # for the first (outermost) entry).
+        chain: list[tuple[Stacktrace, str | None]] = [(chain_root, None)]
+        seen: set[int] = {id(chain_root)}
+        current: Stacktrace | None = chain_root
+        depth = 0
+        while current is not None and depth < _MAX_EXCEPTION_CHAIN_DEPTH:
+            # Prefer ``__cause__`` (``raise X from Y``) over
+            # ``__context__`` (implicit during-handling) to match
+            # CPython's ``traceback`` precedence.
+            next_stacktrace: Stacktrace | None = current.get_cause()
+            label = _SEPARATOR_LABEL_CAUSE
+            if next_stacktrace is None:
+                next_stacktrace = current.get_context()
+                label = _SEPARATOR_LABEL_CONTEXT
+            if next_stacktrace is None:
+                break
+            if id(next_stacktrace) in seen:
+                break
+            seen.add(id(next_stacktrace))
+            chain.append((next_stacktrace, label))
+            current = next_stacktrace
+            depth += 1
+
+        # Emit innermost-first: reverse the walked chain so the
+        # original cause is at the top of the panel and the most
+        # recently raised exception sits at the bottom, matching
+        # CPython's ``traceback.print_exception`` output.
+        chain.reverse()
+
+        # Cache the (possibly filtered) frame list per stacktrace so
+        # the emit loop below doesn't have to recompute it. Without
+        # this, a stacktrace of N frames emitting M of them would
+        # drive an O(M·N) worst-case rebuild + filter-match cost
+        # when ``hideFilteredFrames`` is on.
+        stacktrace_frames_by_id: dict[int, list[Frame]] = {}
+        flat: list[tuple[str, Stacktrace | None, int | str]] = []
+        for index, (stacktrace, separator_label) in enumerate(chain):
+            # ``separator_label`` records how the walk stepped INTO
+            # this entry from the next-outer one. After reversal, the
+            # next-outer entry now sits BELOW us, so the separator
+            # should appear AFTER this entry's frames (pointing up at
+            # us, the cause).
+            stacktrace_frames = list(stacktrace.frames)
+            if self._hide_filtered_frames:
+                stacktrace_frames = [
+                    f for f in stacktrace_frames if not self._is_filtered_frame(f)
+                ]
+            stacktrace_frames_by_id[int(stacktrace.id)] = stacktrace_frames
+            for idx, _frame in enumerate(stacktrace_frames):
+                flat.append(("frame", stacktrace, idx))
+            # Append the separator only if there's something below us
+            # (i.e., we're not the last / outermost entry) and we have
+            # a recorded label.
+            if index < len(chain) - 1 and separator_label is not None:
+                flat.append(("separator", None, separator_label))
+
+        # Re-filter: if ``hideFilteredFrames`` is on AND some exception
+        # frame group winds up empty, the orphan separator just above
+        # or below it should also be dropped so we never emit two
+        # separators in a row.
+        flat = _prune_orphan_separators(flat)
+        total = len(flat)
+
+        if start_frame < 0:
+            start_frame = 0
+        if levels <= 0:
+            end = total
+        else:
+            end = min(total, start_frame + levels)
+
+        dap_frames: list[dict[str, Any]] = []
+        for entry in flat[start_frame:end]:
+            kind = entry[0]
+            if kind == "separator":
+                label = entry[2]
+                assert isinstance(label, str)
+                frame_id = self._register_separator_frame(label)
+                dap_frames.append(self._format_separator_frame(frame_id, label))
+                continue
+            stacktrace = entry[1]
+            idx = entry[2]
+            assert stacktrace is not None
+            assert isinstance(idx, int)
+            frame_obj = stacktrace_frames_by_id[int(stacktrace.id)][idx]
+            frame_id = self._register_frame(int(stacktrace.id), idx)
+            dap_frames.append(self._format_frame(frame_id, frame_obj))
+
+        return {"stackFrames": dap_frames, "totalFrames": total}
+
+    def _register_separator_frame(self, label: str) -> int:
+        """Allocate a frame-id for a separator row and remember its label."""
+        frame_id = self._next_frame_id
+        self._next_frame_id += 1
+        self._separator_frames[frame_id] = label
+        return frame_id
+
+    def _format_separator_frame(self, frame_id: int, label: str) -> dict[str, Any]:
+        """Shape the DAP ``StackFrame`` dict for a separator label row.
+
+        ``presentationHint: "label"`` tells VS Code to render the row
+        as a non-navigable header (no source link, no click-to-open).
+        ``line: 0`` and omitting ``source`` signal "no location".
+        """
+        return {
+            "id": frame_id,
+            "name": label,
+            "line": 0,
+            "column": 0,
+            "presentationHint": "label",
+        }
+
     def handle_scopes(self, arguments: dict[str, Any]) -> dict[str, Any]:
         frame_id = int(arguments.get("frameId", 0))
+        # Separator "label" frames in the virtual exception-chain view
+        # have no locals/scopes — VS Code may still issue ``scopes`` on
+        # them when the user focuses the row, so return an empty list
+        # rather than raising.
+        if frame_id in self._separator_frames:
+            return {"scopes": []}
         if frame_id not in self._frames:
             raise DispatchError(f"frame {frame_id} is not registered")
         # Cache scope refs per frame so repeated ``scopes(frameId)`` calls
@@ -552,9 +775,31 @@ class SnapshotDebugSession:
     def handle_exception_info(self, arguments: dict[str, Any]) -> dict[str, Any]:
         snapshot = self._require_snapshot()
         thread_id = int(arguments.get("threadId", 0))
-        stacktrace = snapshot.stacktraces.get(thread_id)
-        if stacktrace is None:
-            raise DispatchError(f"thread {thread_id} not found in snapshot")
+        # The virtual exception-chain thread has no real ``Stacktrace``
+        # entry in ``snapshot.stacktraces``; route the request to the
+        # **innermost** (original cause) exception. VS Code uses the
+        # ExceptionInfo response (``exceptionId`` / ``description``) to
+        # drive the red "Exception has occurred" decoration anchored
+        # on the top stack frame, which under the flattened chain
+        # view is the innermost cause's innermost frame. Surfacing
+        # the outer exception's info here would paint the cause's
+        # raise site with the effect's message. ``innerException`` is
+        # naturally empty from the innermost (it has no further
+        # cause), which matches the user's perspective at the top
+        # frame; the outer exception's info still surfaces to the
+        # user via the CALL STACK panel's flattened chain rows.
+        if thread_id == _EXCEPTION_CHAIN_THREAD_ID:
+            stacktrace = _pick_exception_chain_innermost(
+                snapshot, is_filtered=self._is_filtered_thread
+            )
+            if stacktrace is None:
+                raise DispatchError(
+                    "virtual exception-chain thread has no exception stacktraces"
+                )
+        else:
+            stacktrace = snapshot.stacktraces.get(thread_id)
+            if stacktrace is None:
+                raise DispatchError(f"thread {thread_id} not found in snapshot")
         body = build_exception_info(stacktrace, self._sources)
         if body is None:
             raise DispatchError(f"thread {thread_id} has no exception info")
@@ -747,6 +992,7 @@ class SnapshotDebugSession:
         self._frames.clear()
         self._frame_ids.clear()
         self._frame_scopes.clear()
+        self._separator_frames.clear()
         self._next_frame_id = 1
         self._variables.clear()
 
@@ -755,6 +1001,7 @@ class SnapshotDebugSession:
         self._frames.clear()
         self._frame_ids.clear()
         self._frame_scopes.clear()
+        self._separator_frames.clear()
         self._next_frame_id = 1
         self._variables.clear()
 
@@ -802,7 +1049,11 @@ class SnapshotDebugSession:
         # Prefer an exception thread so VS Code highlights the Exception Info
         # panel; fall back to the first thread otherwise. If no threads at all,
         # skip the ``stopped`` event (DAP reserves threadId 0 for "no thread").
-        thread_id = _pick_stop_thread(snapshot, self._preferred_thread_name)
+        thread_id = _pick_stop_thread(
+            snapshot,
+            self._preferred_thread_name,
+            is_filtered_thread=self._is_filtered_thread,
+        )
         if thread_id is None:
             self._dispatcher.send_event(
                 "output",
@@ -824,6 +1075,20 @@ class SnapshotDebugSession:
         }
         if description:
             body["description"] = description
+        # Populate ``body.text`` with the exception's type + message so
+        # VS Code renders the red "Exception has occurred" overlay on
+        # the offending frame's source line (and a matching hover
+        # tooltip). DAP-spec ``stopped.text`` drives this rendering;
+        # without it VS Code has no message to attach to the frame.
+        # We pick the text from the stopped thread's exception so the
+        # overlay always reflects what the user is currently focused
+        # on, falling back to any other exception in the snapshot.
+        if has_exception:
+            text = _format_stopped_exception_text(
+                snapshot, thread_id, is_filtered_thread=self._is_filtered_thread
+            )
+            if text:
+                body["text"] = text
         self._dispatcher.send_event("stopped", body)
 
     # ---------------------------------------------------------------
@@ -850,11 +1115,18 @@ class SnapshotDebugSession:
         # dropped matching frames before we get here — so anything we
         # see is a frame the user wants to see. In the default (not
         # hidden) mode, we keep matching frames but mark them
-        # ``"deemphasize"`` so VS Code renders them italic/grey while
-        # still letting the user click through.
+        # ``"subtle"`` so VS Code renders them italic/grey while still
+        # letting the user click through.
+        #
+        # Note on the DAP spec: ``StackFrame.presentationHint`` is
+        # ``"normal" | "label" | "subtle"``. ``"deemphasize"`` is only
+        # valid on ``Source.presentationHint`` — using it on a frame
+        # is a spec violation that VS Code tolerates but pydevd avoids.
+        # We match pydevd's ``"subtle"`` choice here for maximum
+        # compatibility.
         hint = "normal"
         if not self._hide_filtered_frames and self._is_filtered_frame(frame):
-            hint = "deemphasize"
+            hint = "subtle"
         return {
             "id": frame_id,
             "name": frame.function_qualname or frame.function_name,
@@ -993,6 +1265,16 @@ class SnapshotDebugSession:
 # ---------------------------------------------------------------
 
 
+# Stable "preferred thread name" sentinel for the virtual exception
+# chain view. ``handle_stack_trace`` stashes this in
+# ``_preferred_thread_name`` whenever the user focuses the chain
+# thread; ``_pick_stop_thread`` then prefers it on later snapshot
+# jumps. Real thread names can never clash because a real thread name
+# is always ``stacktrace.thread_name`` (never prefixed with ``<<`` /
+# ``>>``).
+_EXCEPTION_CHAIN_PREFERRED_NAME = "<<exception-chain>>"
+
+
 def _describe_thread(stacktrace: Stacktrace) -> str:
     """Human-readable label for the CALL STACK panel."""
     name = stacktrace.thread_name
@@ -1007,6 +1289,253 @@ def _describe_thread(stacktrace: Stacktrace) -> str:
     if name:
         return name
     return f"Thread {stacktrace.id}"
+
+
+def _format_stopped_exception_text(
+    snapshot: Snapshot,
+    stopped_thread_id: int,
+    *,
+    is_filtered_thread: Callable[[Stacktrace], bool] | None = None,
+) -> str | None:
+    """Render the ``stopped.text`` overlay for an exception snapshot.
+
+    Picks the exception to surface in the red "Exception has
+    occurred" overlay by preferring the stopped thread's exception,
+    falling back to the first exception-carrying stacktrace in the
+    snapshot. Returns ``None`` when no exception is reachable (the
+    caller will then skip setting ``body.text``).
+
+    The output shape is ``"<ExcType>: <message>"`` (matching CPython's
+    ``traceback`` output), trimmed to a single line and bounded in
+    length so the overlay tooltip stays readable even when the
+    exception repr is huge.
+
+    ``is_filtered_thread`` is forwarded to the chain picker when
+    ``stopped_thread_id`` is the virtual chain sentinel, so the
+    overlay text mirrors the filtered thread selection.
+    """
+    # Hard cap on the overlay text — VS Code shows this in a small
+    # hover, and very long messages make the tooltip unusable.
+    _MAX_TEXT_LEN = 512
+    # The virtual exception-chain thread has no real entry in
+    # ``stacktraces``; route it to the **innermost** (original cause)
+    # exception. VS Code anchors ``stopped.text`` on the top stack
+    # frame, which under the flattened chain view is the innermost
+    # cause's innermost frame (see ``_build_exception_chain_stack_trace``
+    # for the flat layout). Surfacing the outermost exception's text
+    # there would decorate the cause's raise site with the effect's
+    # message — a mismatch that makes the hover actively misleading.
+    if stopped_thread_id == _EXCEPTION_CHAIN_THREAD_ID:
+        preferred = _pick_exception_chain_innermost(
+            snapshot, is_filtered=is_filtered_thread
+        )
+    else:
+        preferred = snapshot.stacktraces.get(stopped_thread_id)
+    candidates: list[Stacktrace] = []
+    if preferred is not None and preferred.exception_object is not None:
+        candidates.append(preferred)
+    for st in snapshot.stacktraces.values():
+        if st is preferred:
+            continue
+        if st.exception_object is not None:
+            candidates.append(st)
+
+    for st in candidates:
+        exc = st.exception_object
+        if exc is None:
+            continue
+        type_name = type(exc).__name__
+        # Extract the class name from the repr when tintype serialized
+        # the original class (e.g. ``ValueError('x')`` -> ``ValueError``).
+        try:
+            rep = repr(exc)
+        except Exception:  # noqa: BLE001
+            rep = ""
+        paren = rep.find("(")
+        if paren > 0:
+            candidate = rep[:paren].strip()
+            if candidate:
+                type_name = candidate
+
+        message: str
+        try:
+            message = str(exc)
+        except Exception:  # noqa: BLE001
+            message = rep
+        # Collapse the overlay onto one line — newlines in the
+        # message would otherwise be rendered literally.
+        message = message.replace("\n", " ").replace("\r", " ").strip()
+        text = f"{type_name}: {message}" if message else type_name
+        if len(text) > _MAX_TEXT_LEN:
+            text = text[: _MAX_TEXT_LEN - 1] + "…"
+        return text
+
+    return None
+
+
+def _pick_exception_chain_root(
+    snapshot: Snapshot,
+    *,
+    is_filtered: Callable[[Stacktrace], bool] | None = None,
+) -> Stacktrace | None:
+    """Return the stacktrace that should head the virtual chain thread.
+
+    The "root" is the outermost exception — i.e. the one that isn't
+    reachable as another stacktrace's ``__cause__`` / ``__context__``.
+    Tintype writers conventionally serialize exception stacktraces in
+    raised-first order, so the first exception-bearing stacktrace in
+    insertion order usually satisfies this criterion. When multiple
+    unrelated exceptions exist in a single snapshot (unusual, but
+    possible for multi-thread captures), we pick the first one we see
+    and accept that the others stay hidden behind the virtual view —
+    a follow-up could emit one virtual thread per independent chain.
+
+    ``is_filtered`` (optional) — predicate matching
+    :meth:`SnapshotDebugSession._is_filtered_thread`. When provided,
+    stacktraces for which it returns ``True`` are skipped. This keeps
+    the virtual chain row consistent with ``handle_threads``'s
+    thread-level filtering: if every exception-bearing stacktrace is
+    framework noise (e.g. all pydevd/debugpy frames), no virtual
+    thread is emitted and the caller falls back to non-chain focus
+    rather than surfacing an empty CALL STACK. When ``is_filtered`` is
+    ``None`` the function accepts all exception stacktraces — used by
+    module-level callers that don't have access to the session's
+    filter state.
+
+    Returns ``None`` when the snapshot has no (non-filtered) exception
+    stacktraces.
+    """
+    accept: Callable[[Stacktrace], bool] = (
+        (lambda st: not is_filtered(st))
+        if is_filtered is not None
+        else (lambda _st: True)
+    )
+    inner_ids: set[int] = set()
+    for st in snapshot.stacktraces.values():
+        if st.exception_object is None:
+            continue
+        if not accept(st):
+            continue
+        cause = st.get_cause()
+        if cause is not None:
+            inner_ids.add(id(cause))
+        context = st.get_context()
+        if context is not None:
+            inner_ids.add(id(context))
+    for st in snapshot.stacktraces.values():
+        if st.exception_object is None:
+            continue
+        if not accept(st):
+            continue
+        if id(st) in inner_ids:
+            continue
+        return st
+    # Fallback: every (non-filtered) exception is reachable from
+    # another (pure cycle — shouldn't happen in practice, but be
+    # defensive). Use the first non-filtered exception we find so the
+    # panel still has something to show.
+    for st in snapshot.stacktraces.values():
+        if st.exception_object is not None and accept(st):
+            return st
+    return None
+
+
+def _pick_exception_chain_innermost(
+    snapshot: Snapshot,
+    *,
+    is_filtered: Callable[[Stacktrace], bool] | None = None,
+) -> Stacktrace | None:
+    """Return the innermost (original cause) exception in the chain.
+
+    Walks from :func:`_pick_exception_chain_root` down through
+    ``__cause__`` (preferred) / ``__context__`` links, bounded by
+    :data:`_MAX_EXCEPTION_CHAIN_DEPTH` and cycle-guarded via an
+    ``id()`` seen-set, and returns the deepest reachable stacktrace.
+
+    Used to source the ``stopped.text`` overlay for exception
+    snapshots: VS Code anchors the red "Exception has occurred" hover
+    on the **top** stack frame, which under the flattened chain view
+    is the innermost cause's innermost frame. Surfacing the outermost
+    exception's text there would label the wrong line (the cause's
+    raise site) with the effect's message.
+
+    Returns ``None`` when the snapshot has no (non-filtered) exception
+    stacktraces.
+    """
+    current = _pick_exception_chain_root(snapshot, is_filtered=is_filtered)
+    if current is None:
+        return None
+    seen: set[int] = {id(current)}
+    depth = 0
+    while depth < _MAX_EXCEPTION_CHAIN_DEPTH:
+        next_stacktrace: Stacktrace | None = current.get_cause()
+        if next_stacktrace is None:
+            next_stacktrace = current.get_context()
+        if next_stacktrace is None or id(next_stacktrace) in seen:
+            break
+        seen.add(id(next_stacktrace))
+        current = next_stacktrace
+        depth += 1
+    return current
+
+
+def _describe_exception_chain(chain_root: Stacktrace) -> str:
+    """Label for the virtual exception-chain thread row.
+
+    Format: ``Exception: <ExcType>(<short message>)``. Falls back to
+    just the type name when ``str(exc)`` is empty. Never includes a
+    ``Thread N`` prefix — the whole point of the virtual thread is
+    that it isn't a thread.
+    """
+    exc = chain_root.exception_object
+    if exc is None:
+        return "Exception"
+    try:
+        rep = repr(exc)
+    except Exception:  # noqa: BLE001
+        rep = type(exc).__name__
+    type_name = type(exc).__name__
+    paren = rep.find("(")
+    if paren > 0:
+        candidate = rep[:paren].strip()
+        if candidate:
+            type_name = candidate
+    try:
+        message = str(exc)
+    except Exception:  # noqa: BLE001
+        message = ""
+    # Collapse multi-line messages onto one line for the CALL STACK
+    # header row — VS Code truncates but newlines render awkwardly.
+    message = message.replace("\n", " ").replace("\r", " ").strip()
+    if message:
+        return f"Exception: {type_name}({message})"
+    return f"Exception: {type_name}"
+
+
+def _prune_orphan_separators(
+    flat: list[tuple[str, Stacktrace | None, int | str]],
+) -> list[tuple[str, Stacktrace | None, int | str]]:
+    """Drop separator entries that end up adjacent or leading/trailing.
+
+    After ``hideFilteredFrames`` filtering, an exception's entire
+    frame group may be empty, leaving two separators back-to-back or
+    a separator at the very start/end of the flattened list. Those
+    separators carry no useful information and would render as
+    orphaned header rows, so we drop them.
+    """
+    result: list[tuple[str, Stacktrace | None, int | str]] = []
+    prev_kind: str | None = None
+    for entry in flat:
+        kind = entry[0]
+        if kind == "separator" and prev_kind in (None, "separator"):
+            continue
+        result.append(entry)
+        prev_kind = kind
+    # Trim a trailing separator if the last non-separator group was
+    # dropped entirely.
+    while result and result[-1][0] == "separator":
+        result.pop()
+    return result
 
 
 def _scope_sort_key(name: str) -> tuple[int, str]:
@@ -1047,21 +1576,37 @@ def _pick_stop_thread(
     for empty snapshots and callers skip the ``stopped`` event entirely.
 
     Priority:
-      1. If ``preferred_thread_name`` is set and a thread with that name
-         exists in the snapshot, return its id — this preserves the
-         user's focus across snapshot jumps.
-      2. First thread with an exception — highlights the Exception Info
-         panel when the user hasn't selected a thread yet.
-      3. First thread in snapshot insertion order.
+      1. If the preferred thread name is the virtual exception-chain
+         sentinel (user previously focused the synthetic chain view),
+         return :data:`_EXCEPTION_CHAIN_THREAD_ID` so focus stays on
+         that view across snapshot jumps as long as it exists.
+      2. If ``preferred_thread_name`` is set and a thread with that
+         name exists in the snapshot, return its id — this preserves
+         the user's focus across snapshot jumps.
+      3. If the snapshot has any exception stacktrace, return
+         :data:`_EXCEPTION_CHAIN_THREAD_ID` — the virtual chain view is
+         the natural landing spot for exception snapshots and makes VS
+         Code highlight the Exception Info panel.
+      4. First thread in snapshot insertion order.
+
+    ``is_filtered_thread`` is forwarded to
+    :func:`_pick_exception_chain_root` so the chain-view landing step
+    (priority 1 and 3) only fires when at least one non-filtered
+    exception stacktrace exists. This keeps the stop-focus consistent
+    with what ``handle_threads`` surfaces in the UI.
     """
+    has_chain = (
+        _pick_exception_chain_root(snapshot, is_filtered=is_filtered_thread) is not None
+    )
+    if has_chain and preferred_thread_name == _EXCEPTION_CHAIN_PREFERRED_NAME:
+        return _EXCEPTION_CHAIN_THREAD_ID
     if preferred_thread_name is not None:
         for st in snapshot.stacktraces.values():
             name = st.thread_name or f"Thread {int(st.id)}"
             if name == preferred_thread_name:
                 return int(st.id)
-    for st in snapshot.stacktraces.values():
-        if st.exception_object is not None:
-            return int(st.id)
+    if has_chain:
+        return _EXCEPTION_CHAIN_THREAD_ID
     first = next(iter(snapshot.stacktraces.values()), None)
     if first is None:
         return None
