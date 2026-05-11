@@ -67,7 +67,7 @@ ext_modules = [
         include_dirs=["."] + zstd_include_dirs,
         library_dirs=zstd_library_dirs,
         libraries=["zstd"],
-        cxx_std=17,
+        cxx_std=20,
         define_macros=[("PYBIND11_DETAILED_ERROR_MESSAGES", None)],
     ),
 ]
