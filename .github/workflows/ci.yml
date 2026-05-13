@@ -17,6 +17,14 @@ jobs:
     name: build-and-test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      # Match release.yml's wheel target (CIBW_ENVIRONMENT_MACOS) so CI builds
+      # the same ABI as published wheels. Also raises the floor above macOS 10.15,
+      # which is required for std::filesystem symbols to be available — the
+      # Python.org 3.12+ universal2 frameworks declare a 10.13 deployment target
+      # in sysconfig, which propagates into extension builds and marks
+      # <filesystem> as unavailable. Ignored on Linux.
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     strategy:
       fail-fast: false
       matrix:
