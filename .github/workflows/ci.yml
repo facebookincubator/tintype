@@ -54,3 +54,28 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v
+
+  notify:
+    name: notify-on-failure
+    needs: build-and-test
+    # Single workflow-level notification: fires once if ANY leg of the
+    # build-and-test matrix failed, instead of per-leg (avoids 6x noise
+    # from the 2 OS x 3 Python matrix). `failure()` at job scope returns
+    # true when any job in `needs:` has the `failure` result.
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Notify GChat on failure
+        env:
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          text=$(printf '❌ *GitHub Action Failed*\n\n*Repo:* %s\n*Branch:* %s\n*Workflow:* %s\n*Run:* %s' \
+            "$REPO" "$REF_NAME" "$WORKFLOW" "$RUN_URL")
+          curl -X POST "$GCHAT_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg text "$text" '{text: $text}')"
