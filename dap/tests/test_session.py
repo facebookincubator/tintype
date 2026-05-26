@@ -167,12 +167,14 @@ class SessionHandlerTest(unittest.TestCase):
 
         messages = _drain_messages(self.stream)
         # We expect: launch response, initialized, thread(s), two
-        # stopped events (bootstrap + real). The bootstrap carries a
-        # generic ``"Snapshot"`` description so VS Code has something to
-        # overwrite on its initial-launch race; the real event that
-        # follows sets the actual display name the user sees in the
-        # CALL STACK panel. We still emit NO ``process`` event — that
-        # surface is owned by the Tintype Snapshots sidebar.
+        # stopped events (bootstrap + real). Both currently carry the
+        # static ``"Snapshot"`` description; the bootstrap-then-real
+        # pattern is retained because VS Code overwrites the
+        # description on the first event of a launch, and any future
+        # reintroduction of a dynamic display name needs the second
+        # event to settle the real value. We still emit NO ``process``
+        # event — that surface is owned by the Tintype Snapshots
+        # sidebar.
         event_names = [m.get("event") for m in messages if m["type"] == "event"]
         self.assertIn("initialized", event_names)
         self.assertNotIn("process", event_names)
@@ -180,15 +182,8 @@ class SessionHandlerTest(unittest.TestCase):
         self.assertEqual(event_names.count("stopped"), 2)
 
         stopped_events = [m for m in messages if m.get("event") == "stopped"]
-        # First is bootstrap — generic "Snapshot" label.
         self.assertEqual(stopped_events[0]["body"]["description"], "Snapshot")
-        # Second is the real one — must include a richer description.
-        self.assertIn("description", stopped_events[1]["body"])
-        self.assertIn("Snapshot", stopped_events[1]["body"]["description"])
-        self.assertNotEqual(
-            stopped_events[0]["body"]["description"],
-            stopped_events[1]["body"]["description"],
-        )
+        self.assertEqual(stopped_events[1]["body"]["description"], "Snapshot")
 
     def test_launch_succeeds_on_empty_snapshot_file(self) -> None:
         """An empty ``.pytb`` is a valid launch state.
@@ -1774,9 +1769,13 @@ class SessionHandlerTest(unittest.TestCase):
 
 class StoppedEventDescriptionTest(unittest.TestCase):
     """``stopped`` events carry a ``description`` field with the snapshot's
-    display name. On launch we send a bootstrap ``"Snapshot"`` event first so
-    VS Code has something to overwrite on its initial-launch race, followed
-    by the real description event the user actually sees."""
+    display name. The label is currently the static string ``"Snapshot"`` —
+    a dynamic ``N/M — timestamp`` form looked correct on launch but went
+    stale on subsequent ``tintypeJumpToSnapshot`` calls because VS Code
+    does not consistently re-render CALL STACK descriptions on every
+    ``stopped`` event after the first. A stale dynamic label is more
+    misleading than a static one — the snapshot index / timestamp the
+    user needs is already visible in the snapshots panel."""
 
     def setUp(self) -> None:
         self.stream = RecordingStream()
@@ -1805,38 +1804,9 @@ class StoppedEventDescriptionTest(unittest.TestCase):
             )
         return reader
 
-    def test_launch_description_includes_timestamp_and_index(self) -> None:
-        st = _make_stacktrace(
-            100, [_make_frame("/a/b.py", "foo", 1, {})], thread_name="MainThread"
-        )
-        snap = _make_snapshot([st], ts=1_700_000_000_000_000)
-        self._launch_with_snapshots([snap])
-
-        stopped_events = [
-            m for m in _drain_messages(self.stream) if m.get("event") == "stopped"
-        ]
-        real = stopped_events[-1]["body"]
-        self.assertIn("description", real)
-        self.assertIn("Snapshot", real["description"])
-        # HH:MM:SS.fff pattern must show up in the real-stop description.
-        self.assertRegex(real["description"], r"\d{2}:\d{2}:\d{2}\.\d{3}")
-
-    def test_description_mentions_exception_type(self) -> None:
-        st = _make_stacktrace(
-            100,
-            [_make_frame("/a/b.py", "foo", 1, {})],
-            thread_name="MainThread",
-            exception=KeyError("missing"),
-        )
-        snap = _make_snapshot([st])
-        self._launch_with_snapshots([snap])
-
-        real = [m for m in _drain_messages(self.stream) if m.get("event") == "stopped"][
-            -1
-        ]["body"]
-        self.assertIn("KeyError", real["description"])
-
-    def test_description_updates_across_snapshot_jumps(self) -> None:
+    def test_description_is_static_snapshot_label(self) -> None:
+        """Every ``stopped`` event — launch, jump, and exception — uses
+        the static ``"Snapshot"`` description."""
         snap1 = _make_snapshot(
             [
                 _make_stacktrace(
@@ -1853,16 +1823,18 @@ class StoppedEventDescriptionTest(unittest.TestCase):
                     100,
                     [_make_frame("/a/b.py", "foo", 2, {})],
                     thread_name="MainThread",
+                    exception=KeyError("missing"),
                 )
             ],
             ts=1_700_000_005_000_000,
         )
         self._launch_with_snapshots([snap1, snap2])
 
-        launch_desc = [
+        launch_stops = [
             m for m in _drain_messages(self.stream) if m.get("event") == "stopped"
-        ][-1]["body"]["description"]
-        self.assertIn("1/2", launch_desc)
+        ]
+        for evt in launch_stops:
+            self.assertEqual(evt["body"]["description"], "Snapshot")
 
         self.stream.seek(0)
         self.stream.truncate()
@@ -1878,9 +1850,11 @@ class StoppedEventDescriptionTest(unittest.TestCase):
         ]
         # Jump emits exactly one stopped event (no bootstrap).
         self.assertEqual(len(jump_events), 1)
-        jump_desc = jump_events[0]["body"]["description"]
-        self.assertIn("2/2", jump_desc)
-        self.assertNotEqual(launch_desc, jump_desc)
+        # Even though snap2 carries an exception, the static label
+        # does not mention the exception type. CALL STACK shows the
+        # exception via the thread name + stop reason; the description
+        # is intentionally minimal.
+        self.assertEqual(jump_events[0]["body"]["description"], "Snapshot")
 
 
 if __name__ == "__main__":
