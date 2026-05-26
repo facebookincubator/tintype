@@ -190,7 +190,16 @@ class SessionHandlerTest(unittest.TestCase):
             stopped_events[1]["body"]["description"],
         )
 
-    def test_launch_fails_on_empty_snapshot_file(self) -> None:
+    def test_launch_succeeds_on_empty_snapshot_file(self) -> None:
+        """An empty ``.pytb`` is a valid launch state.
+
+        The VS Code "snappoints" feature launches the viewer against a
+        freshly initialized working file before any snappoint has fired,
+        so snapshots accrue while the viewer is already open. The launch
+        must succeed; ``initialized`` is sent; and no ``stopped`` event
+        is emitted until the user navigates to a real snapshot via
+        ``tintypeJumpToSnapshot``.
+        """
         reader = MagicMock()
         reader.snapshot_count.return_value = 0
         reader.get_all_source_files.return_value = []
@@ -206,8 +215,46 @@ class SessionHandlerTest(unittest.TestCase):
                 arguments={"pytbPath": "/fake/snap.pytb"},
             )
 
+        messages = _drain_messages(self.stream)
+        responses = [m for m in messages if m.get("type") == "response"]
+        self.assertTrue(responses[0]["success"])
+        events = [m for m in messages if m.get("type") == "event"]
+        self.assertIn("initialized", [e["event"] for e in events])
+        self.assertEqual(
+            [e for e in events if e["event"] == "stopped"],
+            [],
+            "empty launch must not emit a stopped event",
+        )
+
+    def test_threads_on_empty_launch_returns_empty_list(self) -> None:
+        """``threads`` must tolerate the pre-first-snapshot state."""
+        reader = MagicMock()
+        reader.snapshot_count.return_value = 0
+        reader.get_all_source_files.return_value = []
+        with (
+            patch("tintype.dap.session.SnapshotReader", return_value=reader),
+            patch("tintype.dap.session.os.path.isfile", return_value=True),
+        ):
+            _send_request(
+                self.session,
+                self.dispatcher,
+                seq=1,
+                command="launch",
+                arguments={"pytbPath": "/fake/snap.pytb"},
+            )
+            self.stream.seek(0)
+            self.stream.truncate()
+            _send_request(
+                self.session,
+                self.dispatcher,
+                seq=2,
+                command="threads",
+                arguments={},
+            )
+
         response = _drain_messages(self.stream)[0]
-        self.assertFalse(response["success"])
+        self.assertTrue(response["success"])
+        self.assertEqual(response["body"]["threads"], [])
 
     def test_threads_stack_scopes_variables(self) -> None:
         locals_ = {"x": 42, "d": {"key": "value"}}

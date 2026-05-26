@@ -274,9 +274,6 @@ class SnapshotDebugSession:
         except RuntimeError as e:
             raise DispatchError(f"failed to open snapshot: {e}") from e
 
-        if reader.snapshot_count() == 0:
-            raise DispatchError("snapshot file contains no snapshots")
-
         self._reader = reader
         self._pytb_path = pytb
         self._sources.load_from_reader(reader)
@@ -284,25 +281,37 @@ class SnapshotDebugSession:
 
         self._dispatcher.send_event("initialized")
 
-        # Load the first snapshot. ``initialized`` is what tells VS Code it
-        # can start sending configuration requests (breakpoints, exception
-        # filters, etc.); send it before ``stopped`` so the client is ready.
-        # ``_load_snapshot`` emits the single ``process`` event for this
-        # session — VS Code bakes ``body.name`` into the CALL STACK sub-line
-        # at launch time and ignores later emissions, so we only emit once.
-        start_index = int(arguments.get("snapshotIndex") or 0)
-        start_index = max(0, min(start_index, reader.snapshot_count() - 1))
-        self._load_snapshot(start_index)
+        # An empty ``.pytb`` is a valid launch state — a client may
+        # open the viewer against a freshly initialized working file
+        # before any snapshots have been written, so snapshots accrue
+        # while the viewer is already open. With zero snapshots there
+        # is nothing to load and no ``stopped`` event to emit; the
+        # viewer stays in a "waiting" state until the client navigates
+        # to a snapshot via ``tintypeJumpToSnapshot``, which resolves
+        # to a normal ``stopped`` event once the index is valid.
+        # ``handle_threads`` tolerates ``_current_snapshot is None``
+        # for the same reason.
+        if reader.snapshot_count() > 0:
+            # Load the first snapshot. ``initialized`` is what tells VS Code
+            # it can start sending configuration requests (breakpoints,
+            # exception filters, etc.); send it before ``stopped`` so the
+            # client is ready. ``_load_snapshot`` emits the single
+            # ``process`` event for this session — VS Code bakes
+            # ``body.name`` into the CALL STACK sub-line at launch time and
+            # ignores later emissions, so we only emit once.
+            start_index = int(arguments.get("snapshotIndex") or 0)
+            start_index = max(0, min(start_index, reader.snapshot_count() - 1))
+            self._load_snapshot(start_index)
 
-        self._emit_thread_events_started()
-        # Bootstrap-then-real emission pattern: VS Code overwrites the
-        # CALL STACK description on the very first ``stopped`` event of a
-        # launch, so we send a throwaway ``"Snapshot"`` first and
-        # immediately follow it with the real description. The second
-        # event is what the user actually sees. See
-        # :meth:`_send_stopped_event` for the full rationale.
-        self._send_stopped_event(bootstrap=True)
-        self._send_stopped_event()
+            self._emit_thread_events_started()
+            # Bootstrap-then-real emission pattern: VS Code overwrites the
+            # CALL STACK description on the very first ``stopped`` event of a
+            # launch, so we send a throwaway ``"Snapshot"`` first and
+            # immediately follow it with the real description. The second
+            # event is what the user actually sees. See
+            # :meth:`_send_stopped_event` for the full rationale.
+            self._send_stopped_event(bootstrap=True)
+            self._send_stopped_event()
         return None
 
     def handle_attach(self, _arguments: dict[str, Any]) -> dict[str, Any] | None:
@@ -444,7 +453,15 @@ class SnapshotDebugSession:
         return any_frame
 
     def handle_threads(self, _arguments: dict[str, Any]) -> dict[str, Any]:
-        snapshot = self._require_snapshot()
+        # No snapshot loaded yet — the launch saw an empty ``.pytb``
+        # (e.g. snappoint pre-init) and skipped the bootstrap
+        # ``_load_snapshot`` call. Return an empty threads list rather
+        # than raising; VS Code will simply render an empty CALL STACK
+        # until the user navigates to a snapshot via
+        # ``tintypeJumpToSnapshot``.
+        if self._current_snapshot is None:
+            return {"threads": []}
+        snapshot = self._current_snapshot
         threads: list[dict[str, Any]] = []
 
         # When the snapshot carries any exception-bearing stacktraces,
