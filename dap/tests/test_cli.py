@@ -46,6 +46,13 @@ class ListenArgParsingTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             module._parse_args(["/tmp/snap.pytb", "--listen", "not-a-port"])
 
+    def test_pytb_file_optional(self) -> None:
+        """``pytb_file`` is optional — when omitted, validation defers to
+        the DAP ``launch`` handler. Argparse must not raise."""
+        args = module._parse_args([])
+        self.assertIsNone(args.pytb_file)
+        self.assertIsNone(args.listen)
+
 
 class MainFileValidationTest(unittest.TestCase):
     """The CLI fast-fails on obvious path mistakes before touching transports."""
@@ -113,6 +120,33 @@ class MainDispatchTest(unittest.TestCase):
             "tintype.dap.cli.run_session_on_stdio", side_effect=KeyboardInterrupt
         ):
             self.assertEqual(module.main([path]), LauncherExitCode.KEYBOARD_INTERRUPT)
+
+    def test_no_pytb_dispatches_to_stdio(self) -> None:
+        """``pytb_file`` may be omitted entirely; the CLI's existence
+        check is skipped and the transport launches as usual. Path
+        validation is left to ``handle_launch``."""
+        with (
+            unittest.mock.patch(
+                "tintype.dap.cli.run_session_on_stdio", return_value=0
+            ) as stdio_mock,
+            unittest.mock.patch("tintype.dap.cli.serve") as serve_mock,
+        ):
+            rc = module.main([])
+        self.assertEqual(rc, LauncherExitCode.OK)
+        stdio_mock.assert_called_once_with()
+        serve_mock.assert_not_called()
+
+    def test_no_pytb_with_listen_dispatches_to_serve(self) -> None:
+        """Same as ``test_no_pytb_dispatches_to_stdio`` but for the
+        TCP transport branch — ``--listen`` works without a positional."""
+        with (
+            unittest.mock.patch("tintype.dap.cli.serve", return_value=0) as serve_mock,
+            unittest.mock.patch("tintype.dap.cli.run_session_on_stdio") as stdio_mock,
+        ):
+            rc = module.main(["--listen", "0"])
+        self.assertEqual(rc, LauncherExitCode.OK)
+        serve_mock.assert_called_once_with(host="127.0.0.1", port=0)
+        stdio_mock.assert_not_called()
 
 
 class LauncherExitCodeTest(unittest.TestCase):

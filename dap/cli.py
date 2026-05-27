@@ -91,7 +91,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "pytb_file",
-        help="Path to the .pytb snapshot file.",
+        nargs="?",
+        default=None,
+        help=(
+            "Optional path to the .pytb snapshot file. When supplied, the CLI "
+            "fast-fails with INVALID_PYTB if the path is missing or not a "
+            "regular file. When omitted, all path validation is deferred to "
+            "the DAP ``launch`` request's ``pytbPath`` argument."
+        ),
     )
     parser.add_argument(
         "--listen",
@@ -114,23 +121,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> LauncherExitCode:
     """Run the DAP server over stdio (default) or TCP (``--listen``).
 
-    Fast-fails on a missing ``.pytb`` path with
-    :attr:`LauncherExitCode.INVALID_PYTB`; full snapshot validity is
-    left to the DAP ``launch`` handler, which surfaces failures as a
-    DAP error the client can render cleanly.
+    When ``pytb_file`` is supplied as a positional argument, fast-fails
+    on a missing path with :attr:`LauncherExitCode.INVALID_PYTB` before
+    the transport starts. When omitted, all path validation is
+    deferred to the DAP ``launch`` handler — which surfaces failures
+    as DAP errors the client can render cleanly via
+    ``arguments.pytbPath`` — so the path can live entirely in the
+    launch request body.
 
     Returns:
         :attr:`LauncherExitCode.OK` on clean shutdown.
         :attr:`LauncherExitCode.ERROR` when the session loop returns a
         non-zero status.
-        :attr:`LauncherExitCode.INVALID_PYTB` when ``pytb_file`` does
-        not exist or is not a regular file.
+        :attr:`LauncherExitCode.INVALID_PYTB` when a ``pytb_file`` was
+        supplied but does not exist or is not a regular file.
         :attr:`LauncherExitCode.KEYBOARD_INTERRUPT` on SIGINT during the
         serve loop.
     """
     args = _parse_args(argv)
 
-    if not os.path.isfile(args.pytb_file):
+    if args.pytb_file is not None and not os.path.isfile(args.pytb_file):
         print(
             f"tintype_dap_server: pytb path does not exist or is not a "
             f"file: {args.pytb_file}",
