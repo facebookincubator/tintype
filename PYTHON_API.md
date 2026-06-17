@@ -145,9 +145,9 @@ Take a snapshot. Multiple snapshots can be taken before `finalize()`.
 
 **Parameters:**
 - `traceback_or_exception` (`TracebackType | BaseException | None`, default `None`):
-  - `None`: Capture the current call stack (thread snapshot, stacktrace ID 0).
-  - `TracebackType`: Capture the frames from a traceback object (stacktrace ID 0).
-  - `BaseException`: Capture the exception's traceback and the full `__cause__`/`__context__` chain. The thread stacktrace gets ID 0; exception stacktraces get sequential IDs starting from 1.
+  - `None`: Capture the current call stack as a single stacktrace keyed by the native thread identifier (same as `threading.get_ident()`).
+  - `TracebackType`: Capture the frames from a traceback object as a single stacktrace keyed by the native thread identifier.
+  - `BaseException`: Capture the exception's traceback and the full `__cause__`/`__context__` chain. No separate thread stacktrace is captured; the exception stacktraces get sequential IDs starting from 1.
 - `max_frames` (`int | None`, default `None`): Maximum number of frames to capture per stacktrace. `None` means no limit. When the limit is reached, the stacktrace is marked as truncated.
 - `max_object_depth` (`int | None`, default `None`): Maximum depth of object graph traversal. Depth 0 is the frame's local variables. When the limit is reached, non-primitive objects are serialized as their `repr()` string with no children. `None` means no limit. When triggered, the `object_depth_truncated` flag is set on the `Stacktrace` object (the `truncated` flag is NOT affected — it only reflects frame omission).
 - `timeout` (`float | None`, default `None`): Maximum time in seconds for the entire snapshot operation. `None` means no timeout. If the timeout is reached, processing stops and any in-progress frame is discarded. Completed frames are preserved.
@@ -185,10 +185,12 @@ Get timing and performance statistics. Only populated if `initialize(collect_sta
 - `total_objects`: Total number of objects serialized to the heap
 - `snapshot_breakdown`: Granular snapshot timing:
   - `write_frame_record_time_ms`
-  - `total_frame_count`, `total_objects_processed`
+  - `total_frame_count`, `frames_filtered`, `total_objects_processed`, `snapshots_discarded`
 - `object_queue_breakdown`: Granular object queue timing:
   - `object_lookup_time_ms`, `object_processing_time_ms`, `repr_time_ms`, `slots_time_ms`, `attr_access_time_ms`, `class_members_time_ms`, `serialization_time_ms`
-  - `objects_skipped`
+  - `objects_skipped`, `objects_cache_hit`, `string_bytes_cache_hit`
+- `errors`: Total number of errors encountered across all subsystems.
+- `file_extension`: Source-file embedding stats: `{time_ms, count, bytes}`.
 - `object_stats`: Per-type statistics mapping type name to `{count, total_time_ms, avg_time_us, total_bytes, avg_bytes}`
 - `finalize_breakdown`: Granular finalize timing:
   - `file_table_time_ms`, `environment_time_ms`, `manifest_time_ms`, `metadata_time_ms`, `msync_time_ms`, `compression_time_ms`, `output_file_time_ms`, `cleanup_time_ms`
@@ -210,6 +212,8 @@ Capture all Python threads' call stacks in a single snapshot record. Uses `sys._
 **Returns:** A `Snapshot` containing one `Stacktrace` per captured thread (keyed by thread ID), or `None` if another snapshot operation is already in progress.
 
 Auto-initializes with `collect_stats=False` if not already initialized.
+
+**Raises:** `RuntimeError` if running under free-threaded (no-GIL) Python, where capturing other threads' frames can deadlock. Use `take_snapshot()` to capture the current thread instead.
 
 **Reentrancy:** While `snapshot_all_threads()` is running, concurrent calls to `take_snapshot()`, `take_snapshot(exception)`, and `snapshot_all_threads()` return `None` immediately. The reverse also holds — `snapshot_all_threads()` returns `None` if `take_snapshot()` is in progress.
 
@@ -251,7 +255,7 @@ Start periodic sampling. Spawns a C++ timer thread that periodically takes snaps
 - `max_object_depth` (`int | None`, default `None`): Maximum depth of object graph traversal. `None` means no limit.
 - `timeout` (`float`, default `1.0`): Timeout per sample in seconds. In `ALL_THREADS` mode, this is passed to `snapshot_all_threads()`.
 
-**Raises:** `RuntimeError` if sampling is already active or if Python < 3.12.
+**Raises:** `RuntimeError` if sampling is already active, or if running under free-threaded (no-GIL) Python, where sampling is unsupported because capturing other threads' frames can deadlock.
 
 The sampling timer thread is invisible to `snapshot_all_threads()` — it has no Python frames and does not appear in snapshots.
 
@@ -350,6 +354,7 @@ Open a snapshot file for reading. The file may be zstd-compressed or uncompresse
 | `get_stats()` | `dict[str, int]` | Get statistics. Returns live stats for borrowed readers, file stats for file-based readers. |
 | `get_all_source_files()` | `list[SourceFile]` | Get all embedded source files. |
 | `get_extracted_files_dir()` | `str` | Path to temp directory with extracted source files. |
+| `get_working_file_path()` | `str \| None` | Path to the file mmapped by this reader: the temporary decompressed file for file-based readers, or the writer's backing file for borrowed-memory readers. `None` if unavailable. |
 | `get_last_error()` | `str` | Last error message. Empty if no error. |
 | `_read_raw_object(offset)` | `dict \| bool \| None` | Read a raw object from the heap by offset. Internal use only. |
 | `get_python_object(python_id, object_map)` | `Any` | Resolve a Python object ID to a Python object. |
@@ -371,7 +376,7 @@ Represents a single snapshot record. Contains one or more stacktraces and an obj
 |-----------|------|-------------|
 | `timestamp` | `int` | Unix timestamp in microseconds when the snapshot was taken. |
 | `truncated` | `bool` | `True` if this snapshot was truncated due to cancellation, `max_frames`, or timeout. |
-| `stacktraces` | `dict[int, Stacktrace]` | Map from stacktrace ID to `Stacktrace`. ID 0 is the thread/traceback snapshot; IDs 1+ are exception chain entries. |
+| `stacktraces` | `dict[int, Stacktrace]` | Map from stacktrace ID to `Stacktrace`. For thread/traceback snapshots the key is the native thread identifier; for exception snapshots the keys are sequential IDs starting from 1. |
 | `object_map` | `dict[int, int]` | Map from Python object ID to heap offset, used to resolve variable references. |
 
 #### Methods
@@ -380,6 +385,7 @@ Represents a single snapshot record. Contains one or more stacktraces and an obj
 |--------|-------------|-------------|
 | `frames()` | `list[Frame]` | Convenience accessor: frames from the first stacktrace. |
 | `get_prev_snapshot()` | `Snapshot \| None` | Get the previous snapshot in the linked list, or `None` if this is the first snapshot. Caches the result. |
+| `get_next_snapshot()` | `Snapshot \| None` | Get the next (chronologically newer) snapshot, or `None` if this is the most recent snapshot. Caches the result. For borrowed (live) readers, a `None` result is not cached, since newer snapshots may still be appended. |
 | `get_python_object(python_id)` | `Any` | Resolve a Python object ID using this snapshot's object map and reader. |
 
 ### `Stacktrace`
@@ -545,4 +551,4 @@ with sampling(interval, path=path):
 
 ## Related Documentation
 
-- [FILE_FORMAT.md](FILE_FORMAT.md) — Binary file format specification with byte-level struct definitions.
+- [FILE_FORMAT.md](snapshot_lib/FILE_FORMAT.md) — Binary file format specification with byte-level struct definitions.
