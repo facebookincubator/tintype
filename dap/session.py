@@ -114,10 +114,10 @@ def extend_default_exclude_frame_paths(patterns: Iterable[str]) -> None:
     """Append ``patterns`` to :data:`DEFAULT_EXCLUDE_FRAME_PATHS`.
 
     The public tintype module is PyPI-published and can't know about
-    Meta-internal noise (``/sand/``, ``fbvscode_traceback``, etc.).
-    Meta-specific wrappers import this function at module-load time and
-    call it before the DAP server starts, so the augmented list is in
-    place by the time any ``launch`` request is processed.
+    Meta-internal noise (``/sand/``, etc.). Meta-specific wrappers import
+    this function at module-load time and call it before the DAP server
+    starts, so the augmented list is in place by the time any ``launch``
+    request is processed.
 
     This API mutates the module-level list in-place. Callers that
     import ``DEFAULT_EXCLUDE_FRAME_PATHS`` directly will see the
