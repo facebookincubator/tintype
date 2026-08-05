@@ -7,9 +7,7 @@
 """CLI entry point for the tintype DAP server.
 
 Dedicated binary (``tintype_dap_server``) that serves a ``.pytb``
-snapshot over the Debug Adapter Protocol.  Separate from the legacy
-pydevd-based ``tintype_debug_launcher`` so the two flows don't share a
-dispatch branch.
+snapshot over the Debug Adapter Protocol.
 
 Transport:
 

@@ -153,9 +153,9 @@ bool SnapshotReader::open(const std::string& path) {
 
     // Create a unique temporary file for the decompressed data.
     // mkstemp guarantees a fresh path so concurrent readers of the same
-    // compressed source file (e.g., a sibling process attaching
-    // tintype_debug_launcher to the same .pytb) cannot collide on this temp
-    // file. With a shared name, one reader's O_TRUNC + ftruncate corrupts
+    // compressed source file (e.g., a sibling process reading the same
+    // .pytb) cannot collide on this temp file. With a shared name, one
+    // reader's O_TRUNC + ftruncate corrupts
     // another reader's MAP_SHARED mmap (zero-fills the buffer through the
     // shared inode) — see SnapshotWriter::open which already uses mkstemp
     // for the same reason.
