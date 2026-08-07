@@ -412,6 +412,7 @@ Represents a stacktrace within a snapshot. For single-thread snapshots (`take_sn
 | `get_cause()` | `Stacktrace \| None` | Get the `__cause__` stacktrace, or `None` if there is no cause. Caches the result. |
 | `get_context()` | `Stacktrace \| None` | Get the `__context__` stacktrace, or `None` if there is no context. Caches the result. |
 | `get_traceback()` | `TracebackType \| None` | Generate a synthetic Python traceback object from this stacktrace's frames. Useful for feeding into debuggers. |
+| `reconstruct_exception()` | `BaseException \| None` | Reconstruct a `BaseException` from this stacktrace with `__traceback__` and a wired `__cause__`/`__context__` chain, or `None` if it has no exception. At most 10 chained exceptions are wired. Nodes with a wired `__cause__` have `__suppress_context__` set. The reconstructed class is always `Exception` (the original class is not recoverable from a snapshot — read it from the message or `exception_object`). |
 
 #### Internal Attributes
 

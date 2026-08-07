@@ -812,7 +812,23 @@ PYBIND11_MODULE(_snapshot, m) {
 
             return result;
           },
-          "Generate a Python traceback from this stacktrace's frames.");
+          "Generate a Python traceback from this stacktrace's frames.")
+      .def(
+          "reconstruct_exception",
+          [](const py::object& self) -> py::object {
+            // Delegate to the pure-Python helper (mirrors get_traceback's
+            // delegation to tintype._traceback). The helper walks
+            // get_cause()/get_context()/get_traceback() and wires a real
+            // BaseException chain.
+            py::module_ exception_utils =
+                py::module_::import("tintype._exception");
+            py::object fn = exception_utils.attr("reconstruct_exception");
+            return fn(self);
+          },
+          "Reconstruct a BaseException (with wired __cause__/__context__ and "
+          "__traceback__) from this stacktrace, or None if it has no "
+          "exception. The reconstructed class is always Exception; read the "
+          "original class from the message or exception_object.");
 
   py::class_<snapshot::Snapshot>(m, "Snapshot", py::dynamic_attr())
       .def_readonly("timestamp", &snapshot::Snapshot::timestamp)

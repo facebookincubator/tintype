@@ -320,6 +320,16 @@ class Stacktrace:
         """Generate a Python traceback from this stacktrace's frames."""
         ...
 
+    def reconstruct_exception(self) -> BaseException | None:
+        """Reconstruct a BaseException from this stacktrace.
+
+        The reconstructed exception carries __traceback__ and a wired
+        __cause__/__context__ chain. Returns None if the stacktrace has no
+        exception. The reconstructed class is always Exception (the original
+        class is not recoverable from a snapshot).
+        """
+        ...
+
 class Snapshot:
     """Represents a snapshot record."""
 
