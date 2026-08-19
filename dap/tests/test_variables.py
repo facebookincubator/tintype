@@ -217,7 +217,7 @@ class ExpandTest(unittest.TestCase):
             children = expand([1, 2, 3, 4, 5], registry, parent_eval_name="xs")
             self.assertEqual(children[-1]["name"], "<truncated>")
         finally:
-            variables._MAX_CHILDREN = original  # pyre-ignore[9]
+            variables._MAX_CHILDREN = original
 
     def test_attr_view_sorted_by_name(self) -> None:
         """Object ``__dict__`` attributes are returned in a predictable

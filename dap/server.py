@@ -190,9 +190,7 @@ class _StdioStream:
         reader: Any | None = None,
         writer: Any | None = None,
     ) -> None:
-        # pyre-ignore[4] — duck-typed binary streams
         self._reader = reader if reader is not None else sys.stdin.buffer
-        # pyre-ignore[4]
         self._writer = writer if writer is not None else sys.stdout.buffer
 
     def read(self, size: int = -1, /) -> bytes:

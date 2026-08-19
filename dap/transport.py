@@ -150,7 +150,6 @@ class BufferedSocketIO(io.RawIOBase):
 
     def __init__(self, sock: object) -> None:
         super().__init__()
-        # pyre-ignore[4] — socket.socket has a stable runtime API we use below.
         self._sock = sock
         self._read_buf: bytearray = bytearray()
 
