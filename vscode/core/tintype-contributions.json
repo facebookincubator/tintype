@@ -1,5 +1,6 @@
 {
   "commandSuffixes": [
+    "openSnapshot",
     "debugger.take-snapshot",
     "debugger.jump-to-snapshot",
     "debugger.refresh-snapshot-list",

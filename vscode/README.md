@@ -18,6 +18,11 @@ VS Code debugger.
 
 The extension never installs Python packages automatically.
 
+The public extension can be installed alongside Python Debugger (Meta). Public
+live capture observes `debugpy` sessions and uses the `tintype` snapshot viewer;
+the Meta extension owns `meta-python` sessions and its separate `tintype-meta`
+viewer.
+
 ### Usage
 
 - Open a saved `.pytb` file from the Explorer context menu.

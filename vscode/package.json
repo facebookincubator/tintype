@@ -31,7 +31,7 @@
       {
         "category": "Tintype",
         "command": "tintype.openSnapshot",
-        "title": "Open Snapshot"
+        "title": "Open Tintype Snapshot"
       },
       {
         "category": "Tintype",
@@ -134,7 +134,7 @@
         {
           "command": "tintype.openSnapshot",
           "when": "resourceExtname == .pytb",
-          "group": "navigation"
+          "group": "navigation@1"
         }
       ],
       "debug/toolBar": [
