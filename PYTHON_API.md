@@ -478,7 +478,10 @@ Represents a deserialized complex Python object that doesn't map to a builtin ty
 
 ### `SerializedListObject(list)`
 
-A `list` subclass representing a deserialized list (or list subclass) with a custom repr and additional attributes accessible via `__dict__`.
+A `list` subclass representing a deserialized list, set, or tuple subclass with
+a custom repr and additional attributes accessible via `__dict__`. Collection
+contents are exposed through the list interface even when the captured object
+was a set or tuple subclass.
 
 ### `SerializedDictObject(dict)`
 
@@ -538,17 +541,21 @@ with sampling(interval, path=path):
 
 | Command | Description |
 |---------|-------------|
+| `tintype-dap-server [--listen [HOST:]PORT]` | Serve snapshots through the Debug Adapter Protocol. The default transport is stdio; `--listen` enables a loopback TCP listener. Snapshot paths are supplied by the DAP client's `launch.pytbPath` request field. |
 | `python -m tintype.utils.tintype_dump /path/to/file.pytb` | Dump a snapshot file as structured text or JSON. |
 | `python -m tintype.utils.tintype_viewer /path/to/file.pytb` | Interactive curses-based snapshot file viewer. |
 
 ## Demo Scripts
 
+After installing Tintype from the repository checkout, run these commands from
+the checkout root. The demo modules are not included in installed wheels.
+
 | Script | Description |
 |--------|-------------|
-| `python -m tintype.demo.tintype_demo` | Captures snapshots with complex object graphs. |
-| `python -m tintype.demo.demo_all_threads` | Captures all threads (CPU workers, native sleepers, lock contention). |
-| `python -m tintype.demo.demo_sampling` | Periodic sampling with ALL_THREADS and SINGLE_THREAD modes. |
-| `python -m tintype.demo.stress_all_threads` | Stress test: concurrent snapshots, ephemeral threads, sampling interactions. |
+| `python demo/tintype_demo.py` | Captures snapshots with complex object graphs. |
+| `python demo/demo_all_threads.py` | Captures all threads (CPU workers, native sleepers, lock contention). |
+| `python demo/demo_sampling.py` | Periodic sampling with ALL_THREADS and SINGLE_THREAD modes. |
+| `python demo/stress_all_threads.py` | Stress test: concurrent snapshots, ephemeral threads, sampling interactions. |
 
 ## Related Documentation
 

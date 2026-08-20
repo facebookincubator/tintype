@@ -165,3 +165,7 @@ def main() -> None:
         f"View with: python -m tintype.utils.tintype_viewer {OUTPUT_PATH}",
         file=sys.stderr,
     )
+
+
+if __name__ == "__main__":
+    main()

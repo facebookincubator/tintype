@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import enum
-import os
 import sys
 
 from tintype.dap.server import run_session_on_stdio, serve
@@ -46,9 +45,6 @@ class LauncherExitCode(enum.IntEnum):
     # Generic failure: import error, no snapshots available,
     # unexpected downstream error, etc.
     ERROR = 1
-    # Input validation failure: the ``.pytb`` file is missing, not a
-    # regular file, or SnapshotReader rejected it as malformed.
-    INVALID_PYTB = 2
     # SIGINT / Ctrl-C received before the session cleanly
     # disconnected — 128 + SIGINT(2) per POSIX convention.
     KEYBOARD_INTERRUPT = 130
@@ -88,17 +84,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "pytb_file",
-        nargs="?",
-        default=None,
-        help=(
-            "Optional path to the .pytb snapshot file. When supplied, the CLI "
-            "fast-fails with INVALID_PYTB if the path is missing or not a "
-            "regular file. When omitted, all path validation is deferred to "
-            "the DAP ``launch`` request's ``pytbPath`` argument."
-        ),
-    )
-    parser.add_argument(
         "--listen",
         type=_parse_listen,
         default=None,
@@ -119,32 +104,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> LauncherExitCode:
     """Run the DAP server over stdio (default) or TCP (``--listen``).
 
-    When ``pytb_file`` is supplied as a positional argument, fast-fails
-    on a missing path with :attr:`LauncherExitCode.INVALID_PYTB` before
-    the transport starts. When omitted, all path validation is
-    deferred to the DAP ``launch`` handler — which surfaces failures
-    as DAP errors the client can render cleanly via
-    ``arguments.pytbPath`` — so the path can live entirely in the
-    launch request body.
+    Snapshot path validation is handled by the DAP ``launch`` handler, which
+    receives the path through the request's ``pytbPath`` argument and can
+    surface failures as DAP errors the client can render cleanly.
 
     Returns:
         :attr:`LauncherExitCode.OK` on clean shutdown.
         :attr:`LauncherExitCode.ERROR` when the session loop returns a
         non-zero status.
-        :attr:`LauncherExitCode.INVALID_PYTB` when a ``pytb_file`` was
-        supplied but does not exist or is not a regular file.
         :attr:`LauncherExitCode.KEYBOARD_INTERRUPT` on SIGINT during the
         serve loop.
     """
     args = _parse_args(argv)
-
-    if args.pytb_file is not None and not os.path.isfile(args.pytb_file):
-        print(
-            f"tintype_dap_server: pytb path does not exist or is not a "
-            f"file: {args.pytb_file}",
-            file=sys.stderr,
-        )
-        return LauncherExitCode.INVALID_PYTB
 
     try:
         if args.listen is not None:

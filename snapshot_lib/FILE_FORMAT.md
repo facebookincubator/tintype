@@ -10,7 +10,10 @@ The Tintype file stores snapshots of Python traceback information including:
 - Source file contents for referenced files
 - User-provided metadata
 
-The file is compressed using zstd. All positions (Pos) are absolute byte offsets from the start of the **uncompressed** data. All offsets (Offset) are relative to a section start (e.g., object heap offsets are relative to the object heap start).
+Output files are zstd-compressed by default, but callers can request an
+uncompressed file. All positions (Pos) are absolute byte offsets from the start
+of the **uncompressed** data. All offsets (Offset) are relative to a section
+start (e.g., object heap offsets are relative to the object heap start).
 
 All multi-byte integers are stored in little-endian byte order. All on-disk structs use `#pragma pack(push, 1)` to eliminate compiler-inserted alignment padding. This makes the binary format portable across platforms (e.g., files written on Linux can be read on macOS).
 
@@ -383,7 +386,9 @@ To read the statistics:
 ## Reading the File
 
 ### Decompression
-The entire file is zstd compressed. Decompress the full file before parsing.
+Read the first four bytes as a little-endian `uint32`. If they equal the magic
+number, the file is already uncompressed and can be parsed directly. Otherwise,
+treat the file as a zstd frame and decompress it fully before parsing.
 
 ### Output Compaction
 During writing, the working file has a zero-filled gap between the snapshot records section and the object heap (used to allow the snapshot records section to grow without relocating the heap). When the output file is produced, this gap is stripped: the snapshot records are immediately followed by the object heap data, and the `FileHeader` position fields (`objectHeapPos`, `fileTablePos`, `envPos`, `manifestPos`, `metadataPos`, `statsPos`) are adjusted to reflect the compacted layout. The `lastSnapshotPos` and all positions within snapshot records (`prevSnapshotPos`, `objectMapPos`) are not adjusted because they fall before the gap. Readers see a contiguous file with no gap.
@@ -415,10 +420,13 @@ import zstandard
 
 def read_snapshot_file(path):
     with open(path, 'rb') as f:
-        compressed = f.read()
+        file_data = f.read()
 
-    dctx = zstandard.ZstdDecompressor()
-    data = dctx.decompress(compressed)
+    if file_data[:4] == struct.pack('<I', 0x50595442):
+        data = file_data
+    else:
+        dctx = zstandard.ZstdDecompressor()
+        data = dctx.decompress(file_data)
 
     # Read FileHeader (100 bytes, packed)
     magic, version = struct.unpack_from('<II', data, 0)
@@ -431,19 +439,19 @@ def read_snapshot_file(path):
      manifest_pos, manifest_size,
      metadata_pos, metadata_size,
      stats_pos, stats_count) = struct.unpack_from(
-        '<QIQIQQQQQQQI', data, 8)
+        '<QIQQIQQQQQQQI', data, 8)
 
     # Read metadata (raw JSON string, size from header)
     metadata_json = data[metadata_pos:metadata_pos + metadata_size]
 
-    # Read most recent snapshot (32-byte header)
+    # Read most recent snapshot (33-byte header)
     pos = last_snapshot_pos
-  timestamp, prev_pos, stacktrace_count, obj_map_pos, obj_map_count, flags = \
+    timestamp, prev_pos, stacktrace_count, obj_map_pos, obj_map_count, flags = \
         struct.unpack_from('<QQIQIB', data, pos)
     pos += 33  # sizeof(SnapshotRecordHeader)
     is_truncated = (flags & 0x01) != 0
 
-    # Read stacktraces (37-byte header + thread name + frames)
+    # Read stacktraces (41-byte header + thread name + frames)
     for s in range(stacktrace_count):
         id, frame_count, exception_python_id, cause_id, context_id, st_flags, \
             thread_name_length = struct.unpack_from('<QIQQQ BI', data, pos)

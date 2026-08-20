@@ -49,3 +49,7 @@ def main() -> None:
         },
     )
     process_request()
+
+
+if __name__ == "__main__":
+    main()

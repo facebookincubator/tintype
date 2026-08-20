@@ -201,3 +201,7 @@ def main() -> None:
         },
     )
     _print_stats()
+
+
+if __name__ == "__main__":
+    main()
