@@ -24,7 +24,7 @@ jobs:
       # Python.org 3.12+ universal2 frameworks declare a 10.13 deployment target
       # in sysconfig, which propagates into extension builds and marks
       # <filesystem> as unavailable. Ignored on Linux.
-      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +39,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
-          cache: 'pip'
+          cache: "pip"
 
       - name: Install zstd (Linux)
         if: runner.os == 'Linux'
@@ -57,15 +57,55 @@ jobs:
       - name: Install tintype
         run: pip install -v .
 
+      - name: Verify installed VS Code integration
+        run: |
+          cd "$RUNNER_TEMP"
+          python -c "import tintype.dap.cli, tintype.vscode"
+          python -c "import importlib.metadata as m; assert m.entry_points(group='console_scripts', name='tintype-dap-server')"
+
       - name: Install test dependencies
         run: pip install pytest
 
       - name: Run tests
         run: pytest tests/ -v
 
+  build-vscode-extension:
+    name: build-vscode-extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install extension dependencies
+        working-directory: vscode
+        run: npm ci
+
+      - name: Build extension
+        working-directory: vscode
+        run: npm run build
+
+      - name: Test extension
+        working-directory: vscode
+        run: npm test
+
+      - name: Build VSIX
+        working-directory: vscode
+        run: npm run package
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: tintype-vsix
+          path: vscode/dist/tintype.vsix
+
   notify:
     name: notify-on-failure
-    needs: build-and-test
+    needs: [build-and-test, build-vscode-extension]
     # Single workflow-level notification: fires once if ANY leg of the
     # build-and-test matrix failed, instead of per-leg (avoids 6x noise
     # from the 2 OS x 3 Python matrix). `failure()` at job scope returns

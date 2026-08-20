@@ -1,0 +1,9 @@
+.eslintrc.cjs
+__mocks__/**
+__tests__/**
+core/**
+dist/*.vsix
+jest.config.cjs
+package-lock.json
+src/**
+tsconfig.json

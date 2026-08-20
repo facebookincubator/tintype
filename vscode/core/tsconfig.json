@@ -1,8 +1,5 @@
 {
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "tsBuildInfoFile": "../../build/tintype-vscode-core.tsbuildinfo"
-  },
+  "extends": "../tsconfig.json",
   "include": [
     "src/**/*"
   ],

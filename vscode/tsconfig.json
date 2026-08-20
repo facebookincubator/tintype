@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "jsx": "react-jsx",
+    "lib": [
+      "ES2022"
+    ],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "noEmit": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "paths": {
+      "tintype-vscode-core": [
+        "./core/src"
+      ],
+      "tintype-vscode-core/*": [
+        "./core/src/*"
+      ]
+    },
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2022",
+    "types": [
+      "jest",
+      "node"
+    ]
+  },
+  "include": [
+    "src/**/*",
+    "__tests__/**/*",
+    "__mocks__/**/*",
+    "core/src/**/*"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

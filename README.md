@@ -108,6 +108,49 @@ def on_snapshot(path: str) -> None:
 tintype.install_exception_hook(callback=on_snapshot)
 ```
 
+## VS Code extension
+
+The Tintype VS Code extension can inspect saved `.pytb` files and capture
+snapshots from live Python programs. It uses the `debugpy` debug type for live
+capture and the `tintype` debug type for the snapshot viewer.
+
+### Requirements
+
+- VS Code 1.96 or newer.
+- Python 3.12 or newer for the extension's snapshot viewer.
+- A compatible `tintype` package installed both in the debug target and in the
+  interpreter used to open snapshot files.
+- `debugpy` for live capture and snappoints.
+
+The extension does not install or modify Python packages automatically. Set
+`tintype.pythonPath` if the interpreter containing `tintype` is different from
+the active environment selected by the Python extension.
+
+### Inspect a saved snapshot
+
+Right-click a `.pytb` file in the Explorer and select **Open Tintype Snapshot**,
+or run the same command from the Command Palette. The snapshot opens as a VS
+Code debug session, where the standard CALL STACK and VARIABLES views can be
+used to inspect threads, frames, exceptions, and objects.
+
+### Capture from a live program
+
+Start a Python debug session backed by `debugpy`, then use **Tintype: Take
+Tintype Snapshot** from the Command Palette or the camera button in the debug
+toolbar. Each capture opens a viewer and appears in the **Tintype Snapshots**
+view. Additional captures can be taken from the original program, navigated in
+the viewer, and saved as a finalized `.pytb` file.
+
+A snappoint captures a snapshot when execution reaches a source line without
+leaving the program stopped. Toggle one from the editor gutter or press
+`Shift+F9` on a Python line.
+
+Live capture currently expects the debug target and the VS Code extension host
+to share a filesystem. Remote-host debugging is not supported yet.
+
+See the [extension documentation](https://github.com/facebookincubator/tintype/tree/main/vscode)
+for the complete command and configuration reference.
+
 ## API Overview
 
 ### Module Functions

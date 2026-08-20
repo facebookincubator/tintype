@@ -1,0 +1,211 @@
+{
+  "name": "tintype",
+  "displayName": "Tintype",
+  "description": "Capture and inspect Python execution snapshots.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "publisher": "fb-external",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/facebookincubator/tintype.git"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onCommand:tintype.openSnapshot",
+    "onLanguage:python",
+    "onDebugResolve:debugpy",
+    "onDebugResolve:tintype"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "category": "Tintype",
+        "command": "tintype.openSnapshot",
+        "title": "Open Snapshot"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.debugger.take-snapshot",
+        "title": "Take Tintype Snapshot",
+        "icon": "$(device-camera)"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.debugger.jump-to-snapshot",
+        "title": "Jump to Snapshot"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.debugger.refresh-snapshot-list",
+        "title": "Refresh Snapshot List"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.debugger.jump-to-last-snapshot",
+        "title": "Jump to Last Snapshot",
+        "icon": "$(refresh)"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.debugger.take-snapshot-on-parent",
+        "title": "Take Snapshot on Parent",
+        "icon": "$(device-camera)"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.debugger.finalize-snapshot-file",
+        "title": "Save Tintype Snapshot File...",
+        "icon": "$(save)"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.snappoint.toggle",
+        "title": "Toggle Snappoint",
+        "icon": "$(record-small)"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.snappoint.add",
+        "title": "Add Snappoint"
+      },
+      {
+        "category": "Tintype",
+        "command": "tintype.snappoint.remove",
+        "title": "Remove Snappoint"
+      }
+    ],
+    "configuration": {
+      "title": "Tintype",
+      "properties": {
+        "tintype.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter containing a compatible Tintype package. Defaults to the active Python extension environment."
+        }
+      }
+    },
+    "debuggers": [
+      {
+        "type": "tintype",
+        "label": "Tintype Snapshot Debugger",
+        "languages": [
+          "python"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "pytbPath": {
+                "type": "string",
+                "description": "Absolute path to the .pytb snapshot file."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory used to resolve source paths."
+              }
+            }
+          },
+          "attach": {
+            "properties": {
+              "pytbPath": {
+                "type": "string",
+                "description": "Absolute path to the .pytb snapshot file."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory used to resolve source paths."
+              }
+            }
+          }
+        }
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "tintype.openSnapshot",
+          "when": "resourceExtname == .pytb",
+          "group": "navigation"
+        }
+      ],
+      "debug/toolBar": [
+        {
+          "command": "tintype.debugger.take-snapshot",
+          "when": "tintype:snapshot:can-take == true",
+          "group": "debug@3"
+        },
+        {
+          "command": "tintype.debugger.jump-to-last-snapshot",
+          "when": "debugType == 'tintype'",
+          "group": "debug@2"
+        },
+        {
+          "command": "tintype.debugger.take-snapshot-on-parent",
+          "when": "debugType == 'tintype'",
+          "group": "debug@4"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "tintype.debugger.finalize-snapshot-file",
+          "when": "view == tintype.snapshot-list && viewItem == 'tintype-viewer-live-injection'",
+          "group": "inline"
+        }
+      ],
+      "editor/lineNumber/context": [
+        {
+          "command": "tintype.snappoint.toggle",
+          "when": "editorLangId == python",
+          "group": "debug@10"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "tintype.snappoint.toggle",
+        "key": "shift+f9",
+        "when": "editorTextFocus && editorLangId == python"
+      }
+    ],
+    "views": {
+      "debug": [
+        {
+          "id": "tintype.snapshot-list",
+          "name": "Tintype Snapshots",
+          "when": "tintype:snapshot:viewer-active == true"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "npm run lint && npm run typecheck && npm run bundle",
+    "bundle": "esbuild src/extension.tsx --bundle --platform=node --external:vscode --alias:tintype-vscode-core/snappoint=./core/src/snappoint/index.tsx --alias:tintype-vscode-core=./core/src/index.tsx --outfile=dist/extension.js",
+    "lint": "eslint --ext .ts,.tsx src core/src __tests__ __mocks__",
+    "package": "vsce package --no-dependencies --out dist/tintype.vsix",
+    "prepackage": "npm run build",
+    "test": "jest --runInBand",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/jest": "29.5.14",
+    "@types/node": "22.13.14",
+    "@types/vscode": "1.96.0",
+    "@typescript-eslint/eslint-plugin": "5.37.0",
+    "@typescript-eslint/parser": "5.62.0",
+    "esbuild": "0.23.0",
+    "eslint": "8.23.1",
+    "jest": "29.7.0",
+    "ts-jest": "29.1.5",
+    "typescript": "5.8.3",
+    "vsce": "2.15.0"
+  }
+}
