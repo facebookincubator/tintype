@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tintype"
-version = "0.1.1"
+version = "0.2.0"
 description = "High-performance Python exception snapshot library"
 readme = "README.md"
 license = "MIT"
@@ -33,6 +33,9 @@ classifiers = [
 Homepage = "https://github.com/facebookincubator/tintype"
 Issues = "https://github.com/facebookincubator/tintype/issues"
 Documentation = "https://github.com/facebookincubator/tintype/blob/main/PYTHON_API.md"
+
+[project.scripts]
+tintype-dap-server = "tintype.dap.cli:main"
 
 # NOTE: Package/package_dir configuration is defined in setup.py.
 # The repo root IS the `tintype` package, so setuptools' auto-discovery

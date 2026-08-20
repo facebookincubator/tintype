@@ -24,6 +24,7 @@ from tintype.dap.session import (
     extend_default_exclude_frame_paths,
     set_default_exclude_frame_paths,
     SnapshotDebugSession,
+    VIEWER_PROTOCOL_VERSION,
 )
 from tintype.dap.transport import read_message
 
@@ -154,6 +155,7 @@ class SessionHandlerTest(unittest.TestCase):
         self.assertTrue(body["supportsExceptionInfoRequest"])
         self.assertTrue(body["supportsConfigurationDoneRequest"])
         self.assertFalse(body["supportsSetVariable"])
+        self.assertEqual(body["tintypeProtocolVersion"], VIEWER_PROTOCOL_VERSION)
         # Restart is used by the viewer toolbar to jump the cursor back to
         # snapshot #0, so the adapter must advertise the capability.
         self.assertTrue(body["supportsRestartRequest"])

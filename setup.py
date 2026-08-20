@@ -75,9 +75,10 @@ ext_modules = [
 setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
-    packages=["tintype", "tintype.tests", "tintype.utils"],
+    packages=["tintype", "tintype.dap", "tintype.tests", "tintype.utils"],
     package_dir={
         "tintype": ".",
+        "tintype.dap": "dap",
         "tintype.tests": "tests",
         "tintype.utils": "utils",
     },

@@ -29,6 +29,8 @@ from tintype.dap.variables import expand, make_variable, VariableRegistry
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+VIEWER_PROTOCOL_VERSION: int = 1
+
 
 # Synthetic "thread" ID used by ``handle_threads`` / ``handle_stack_trace``
 # to represent a flattened exception chain as a single CALL STACK entry.
@@ -249,6 +251,7 @@ class SnapshotDebugSession:
     def handle_initialize(self, _arguments: dict[str, Any]) -> dict[str, Any]:
         """Advertise adapter capabilities."""
         return {
+            "tintypeProtocolVersion": VIEWER_PROTOCOL_VERSION,
             "supportsConfigurationDoneRequest": True,
             "supportsStepBack": True,
             "supportsEvaluateForHovers": True,
