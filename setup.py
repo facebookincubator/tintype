@@ -4,6 +4,8 @@
 
 # @nolint
 import os
+import sys
+import sysconfig
 
 from pybind11.setup_helpers import build_ext, Pybind11Extension
 from setuptools import setup
@@ -42,6 +44,34 @@ def find_zstd():
 
     return include_dirs, library_dirs
 
+
+def set_macos_deployment_target():
+    """Raise the macOS deployment target to at least 10.15.
+
+    pybind11's setup_helpers pins `-mmacosx-version-min=10.14` for C++17 and
+    above whenever MACOSX_DEPLOYMENT_TARGET is unset, but libc++ marks
+    <filesystem> unavailable before 10.15. Honor the interpreter's own target
+    when it is already higher so the wheel's platform tag stays consistent.
+    """
+    if sys.platform != "darwin" or "MACOSX_DEPLOYMENT_TARGET" in os.environ:
+        return
+
+    minimum = (10, 15)
+    target = str(sysconfig.get_config_var("MACOSX_DEPLOYMENT_TARGET") or "")
+    try:
+        parsed = tuple(int(part) for part in target.split("."))
+    except ValueError:
+        parsed = ()
+
+    if parsed < minimum:
+        target = ".".join(str(part) for part in minimum)
+
+    os.environ["MACOSX_DEPLOYMENT_TARGET"] = target
+
+
+# Must run before Pybind11Extension is constructed: its `cxx_std` setter reads
+# MACOSX_DEPLOYMENT_TARGET at construction time.
+set_macos_deployment_target()
 
 zstd_include_dirs, zstd_library_dirs = find_zstd()
 

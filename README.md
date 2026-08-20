@@ -21,7 +21,8 @@ Built as a C++/Python hybrid using pybind11, tintype is designed for minimal ove
 pip install tintype
 ```
 
-**Requirements:** Python ≥ 3.10, a C++17 compiler, and zstd.
+**Requirements:** Python ≥ 3.12, a C++20 compiler, and zstd. On macOS, 10.15 or
+newer is required
 
 ## Quick Start
 
