@@ -1,0 +1,18 @@
+{
+  "commandSuffixes": [
+    "debugger.take-snapshot",
+    "debugger.jump-to-snapshot",
+    "debugger.refresh-snapshot-list",
+    "debugger.jump-to-last-snapshot",
+    "debugger.take-snapshot-on-parent",
+    "debugger.finalize-snapshot-file",
+    "snappoint.toggle",
+    "snappoint.add",
+    "snappoint.remove"
+  ],
+  "viewerConfigurationProperties": [
+    "pytbPath",
+    "cwd"
+  ],
+  "viewSuffix": "snapshot-list"
+}
