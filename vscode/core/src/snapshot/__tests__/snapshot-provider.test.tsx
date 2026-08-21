@@ -17,8 +17,8 @@ const mockShowErrorMessage = jest.fn();
 const mockShowInformationMessage = jest.fn();
 const mockShowWarningMessage = jest.fn();
 const mockShowSaveDialog = jest.fn();
-const mockStartDebugging = jest.fn<(...args: unknown[]) => Promise<boolean>>();
-const mockFsStat = jest.fn<(uri: unknown) => Promise<unknown>>();
+const mockStartDebugging = jest.fn();
+const mockFsStat = jest.fn();
 
 type StartDebuggingCall = [workspaceFolder: unknown, config: Record<string, unknown>];
 
