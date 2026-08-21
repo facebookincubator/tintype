@@ -39,10 +39,11 @@ jest.mock('vscode', () => ({
     },
   },
   window: {
-    showErrorMessage: mockShowErrorMessage,
-    showInformationMessage: mockShowInformationMessage,
-    showWarningMessage: mockShowWarningMessage,
-    showSaveDialog: mockShowSaveDialog,
+    showErrorMessage: (...args: unknown[]): unknown => mockShowErrorMessage(...args) as unknown,
+    showInformationMessage: (...args: unknown[]): unknown =>
+      mockShowInformationMessage(...args) as unknown,
+    showWarningMessage: (...args: unknown[]): unknown => mockShowWarningMessage(...args) as unknown,
+    showSaveDialog: (...args: unknown[]): unknown => mockShowSaveDialog(...args) as unknown,
   },
   workspace: {
     fs: {
@@ -50,7 +51,7 @@ jest.mock('vscode', () => ({
     },
   },
   commands: {
-    executeCommand: mockExecuteCommand,
+    executeCommand: (...args: unknown[]): unknown => mockExecuteCommand(...args) as unknown,
   },
   Uri: {
     file: (fsPath: string) => ({fsPath, path: fsPath, scheme: 'file'}),
