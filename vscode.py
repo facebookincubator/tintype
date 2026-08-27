@@ -64,14 +64,23 @@ def session_info() -> SessionInfo:
     }
 
 
-def capture() -> CaptureResult:
-    """Capture Python execution and return the updated working file."""
+def capture(timeout: float | None = None) -> CaptureResult:
+    """Capture Python execution and return the updated working file.
+
+    ``timeout`` bounds the capture in seconds. On expiry tintype cancels
+    the walk and keeps the frames it already completed, so a slow
+    debuggee yields a truncated snapshot instead of stalling the caller.
+    ``None`` keeps each capture function's own default.
+    """
     is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
-    snapshot = (
-        tintype.take_snapshot()
-        if is_gil_enabled is not None and not is_gil_enabled()
-        else tintype.snapshot_all_threads()
-    )
+    if is_gil_enabled is not None and not is_gil_enabled():
+        snapshot = tintype.take_snapshot(timeout=timeout)
+    elif timeout is None:
+        # ``snapshot_all_threads`` has its own non-None default timeout;
+        # omit the argument rather than overriding it with None.
+        snapshot = tintype.snapshot_all_threads()
+    else:
+        snapshot = tintype.snapshot_all_threads(timeout=timeout)
     event_sequence = _next_event_sequence()
     result: CaptureResult = {
         **session_info(),
