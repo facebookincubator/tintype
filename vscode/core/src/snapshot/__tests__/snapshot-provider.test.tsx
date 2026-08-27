@@ -195,6 +195,17 @@ async function primeViewer(
   return child;
 }
 
+const CAPTURE_PREFIX = "__import__('tintype.vscode', fromlist=['capture']).capture(";
+
+/** Expressions of every ``capture(...)`` evaluate issued on ``session``. */
+function captureCalls(session: MockSession): string[] {
+  const calls = (session.customRequest as unknown as jest.Mock).mock.calls as unknown[][];
+  return calls
+    .filter(([command]) => command === 'evaluate')
+    .map(([, args]) => (args as {expression?: string} | undefined)?.expression ?? '')
+    .filter(expression => expression.startsWith(CAPTURE_PREFIX));
+}
+
 describe('SnapshotProvider', () => {
   let provider: SnapshotProvider;
   let treeProvider: SnapshotTreeProvider;
@@ -269,6 +280,27 @@ describe('SnapshotProvider', () => {
       // Take Snapshot clicks don't collide in the pending map.
       expect(typeof lastConfig.tintypeLaunchToken).toBe('string');
       expect((lastConfig.tintypeLaunchToken as string).length).toBeGreaterThan(0);
+    });
+
+    it('opens the viewer on the snapshot the click produced, not the oldest', async () => {
+      const parent = createParentSession();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+      mockActiveDebugSession = parent;
+
+      let capturesBeforeLaunch = -1;
+      mockStartDebugging.mockImplementation(() => {
+        capturesBeforeLaunch = captureCalls(parent).length;
+        return Promise.resolve(true);
+      });
+
+      await provider.takeSnapshot();
+
+      // Ordering matters: the viewer has to launch *after* the capture
+      // lands, otherwise ``snapshotIndex: -1`` resolves against a file
+      // that does not contain the snapshot the user just asked for.
+      expect(capturesBeforeLaunch).toBe(1);
+      const config = (mockStartDebugging.mock.calls.slice(-1)[0] as StartDebuggingCall)[1];
+      expect(config.snapshotIndex).toBe(-1);
     });
 
     it('reuses the existing viewer on subsequent clicks from the same parent', async () => {

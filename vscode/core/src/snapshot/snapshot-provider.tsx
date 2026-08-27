@@ -362,13 +362,18 @@ export class SnapshotProvider {
   public async ensureSnapshotting(
     session: vscode.DebugSession,
     variant: 'takeSnapshot' | 'takeSnapshotOnParent' = 'takeSnapshot',
+    options: {launchViewer?: boolean} = {},
   ): Promise<void> {
     if (this.injectedSessions.has(session.id)) {
       return;
     }
     let inflight = this.initializationPromises.get(session.id);
     if (inflight == null) {
-      inflight = this.initializeSnapshotting(session, variant).finally(() => {
+      inflight = this.initializeSnapshotting(
+        session,
+        variant,
+        options.launchViewer ?? true,
+      ).finally(() => {
         this.initializationPromises.delete(session.id);
       });
       this.initializationPromises.set(session.id, inflight);
@@ -475,7 +480,11 @@ export class SnapshotProvider {
       // the snapshot itself so the first click always captures the
       // moment the user clicked, regardless of whether the snappoints
       // processor already initialized.
-      await this.ensureSnapshotting(debugSession, variant);
+      // ``launchViewer: false`` — this method owns its viewer and opens
+      // it below, after the capture has landed, so the viewer can start
+      // on the snapshot the user just asked for rather than the oldest
+      // one in the file.
+      await this.ensureSnapshotting(debugSession, variant, {launchViewer: false});
 
       await debugSession.customRequest('evaluate', {
         expression: "__import__('tintype.vscode', fromlist=['capture']).capture()",
@@ -510,7 +519,7 @@ export class SnapshotProvider {
 
       // No registered viewer for the current working file. Two cases:
       //
-      //   1. ``ensureSnapshotting`` just launched a viewer and the child
+      //   1. A concurrent click already launched one and the child
       //      session hasn't fired ``onDidStartDebugSession`` yet — the
       //      ``startDebugging`` promise resolves before VS Code dispatches
       //      the child-start event, so there's a short window where a
@@ -526,12 +535,8 @@ export class SnapshotProvider {
         p => p.parentSessionId === debugSession.id,
       );
       if (hasPendingLaunch) {
-        // Case 1 — init-driven launch will pick up the snapshot. No
-        // extra take-snapshot event is emitted; the init flow already emits
-        // initialize-snapshotting telemetry,
-        // matching the pre-refactor behavior where the first click
-        // returned early after init without producing a take-snapshot
-        // telemetry row.
+        // Case 1 — the in-flight launch will pick up the snapshot, and
+        // whichever click created it emits its own take-snapshot row.
         return;
       }
 
@@ -568,6 +573,7 @@ export class SnapshotProvider {
   private async initializeSnapshotting(
     session: vscode.DebugSession,
     triggerVariant: 'takeSnapshot' | 'takeSnapshotOnParent' = 'takeSnapshot',
+    launchesViewer = true,
   ): Promise<void> {
     this.initializingSessions.add(session.id);
     try {
@@ -583,7 +589,7 @@ export class SnapshotProvider {
 
       let workingFilePath: string;
       let parentCwd: string;
-      let launchToken: string;
+      let launchToken: string | undefined;
       try {
         const response = (await evaluate(
           "__import__('tintype.vscode', fromlist=['session_info']).session_info()['workingFile']",
@@ -607,14 +613,18 @@ export class SnapshotProvider {
           pytbPath: workingFilePath,
           cwd: parentCwd,
         });
-        // Launch the viewer against the working file unconditionally.
-        // The viewer tolerates a zero-snapshot ``.pytb`` at launch time
-        // and stays in a "waiting" state until snapshots accrue (either
-        // a snappoint hits or the user clicks the camera button).
-        // Callers that need a "first" snapshot — e.g. the manual camera
-        // button — issue an explicit ``evaluate`` of
-        // ``tintype.vscode.capture()`` AFTER this init returns.
-        launchToken = await this.launchViewerFor(session, workingFilePath, parentCwd);
+        // Launch the viewer against the working file for callers that
+        // have not opted out. The viewer tolerates a zero-snapshot
+        // ``.pytb`` at launch time and stays in a "waiting" state until
+        // snapshots accrue (either a snappoint hits or the user clicks
+        // the camera button).
+        //
+        // ``takeSnapshotInternal`` opts out: it launches its own viewer
+        // *after* writing the snapshot, so the viewer can open on it
+        // (see ``snapshotIndex: -1`` in ``launchSnapshotDebugSession``).
+        if (launchesViewer) {
+          launchToken = await this.launchViewerFor(session, workingFilePath, parentCwd);
+        }
       } catch (e) {
         this.telemetry.logError(
           session,
@@ -739,6 +749,13 @@ export class SnapshotProvider {
       // CALL STACK headers aren't ambiguous across viewers.
       name: `Tintype (${decoratedParentName})`,
       pytbPath: pytbFilePath,
+      // Negative indices count from the end, so ``-1`` opens on the most
+      // recent snapshot. Every launch through here follows a capture the
+      // user just triggered — the camera button, Take Snapshot on
+      // Parent, or a snappoint firing — so the newest snapshot is the
+      // one they want to see. Opening on the oldest would bury it under
+      // however many snapshots had already accumulated.
+      snapshotIndex: -1,
       parentSessionId: parentSession.id,
       parentSessionName: parentSession.name,
       tintypeLaunchToken: launchToken,
