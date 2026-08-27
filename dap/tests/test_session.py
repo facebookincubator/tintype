@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 
 from tintype.dap.dispatcher import Dispatcher
 from tintype.dap.session import (
+    _resolve_start_index,
     DEFAULT_EXCLUDE_FRAME_PATHS,
     extend_default_exclude_frame_paths,
     set_default_exclude_frame_paths,
@@ -119,7 +120,9 @@ class SessionHandlerTest(unittest.TestCase):
     def tearDown(self) -> None:
         DEFAULT_EXCLUDE_FRAME_PATHS[:] = self._saved_default_exclude
 
-    def _launch_with_snapshots(self, snapshots: list[Any]) -> MagicMock:
+    def _launch_with_snapshots(
+        self, snapshots: list[Any], **launch_arguments: Any
+    ) -> MagicMock:
         """Patch SnapshotReader to yield ``snapshots`` and send ``launch``."""
         reader = MagicMock()
         reader.snapshot_count.return_value = len(snapshots)
@@ -139,9 +142,55 @@ class SessionHandlerTest(unittest.TestCase):
                 self.dispatcher,
                 seq=1,
                 command="launch",
-                arguments={"pytbPath": "/fake/snap.pytb"},
+                arguments={"pytbPath": "/fake/snap.pytb", **launch_arguments},
             )
         return reader
+
+    def test_launch_with_negative_index_opens_the_latest_snapshot(self) -> None:
+        """``snapshotIndex: -1`` is what the camera button sends.
+
+        The viewer must land on the snapshot the click just produced,
+        not on the oldest one already in the working file.
+        """
+        snapshots = [
+            _make_snapshot(
+                [
+                    _make_stacktrace(
+                        100,
+                        [_make_frame("/app/main.py", "main", line, {})],
+                        thread_name="MainThread",
+                    )
+                ]
+            )
+            for line in (10, 20, 30)
+        ]
+        reader = self._launch_with_snapshots(snapshots, snapshotIndex=-1)
+
+        reader.get_snapshot_at_index.assert_any_call(2)
+        stopped = [
+            m
+            for m in _drain_messages(self.stream)
+            if m.get("type") == "event" and m.get("event") == "stopped"
+        ]
+        self.assertTrue(stopped, "launching on a non-empty file should stop")
+
+    def test_launch_without_index_still_opens_the_first_snapshot(self) -> None:
+        """Opening a saved ``.pytb`` should stay chronological."""
+        snapshots = [
+            _make_snapshot(
+                [
+                    _make_stacktrace(
+                        100,
+                        [_make_frame("/app/main.py", "main", line, {})],
+                        thread_name="MainThread",
+                    )
+                ]
+            )
+            for line in (10, 20, 30)
+        ]
+        reader = self._launch_with_snapshots(snapshots)
+
+        reader.get_snapshot_at_index.assert_any_call(0)
 
     def test_initialize_returns_capabilities(self) -> None:
         _send_request(self.session, self.dispatcher, seq=1, command="initialize")
@@ -1942,6 +1991,50 @@ class StoppedEventDescriptionTest(unittest.TestCase):
         # exception via the thread name + stop reason; the description
         # is intentionally minimal.
         self.assertEqual(jump_events[0]["body"]["description"], "Snapshot")
+
+
+class ResolveStartIndexTest(unittest.TestCase):
+    """``snapshotIndex`` resolution for the ``launch``/``attach`` handler."""
+
+    def test_missing_index_opens_the_first_snapshot(self) -> None:
+        """Clients predating the argument must keep their behaviour."""
+        self.assertEqual(_resolve_start_index(None, 5), 0)
+
+    def test_positive_index_is_used_as_is(self) -> None:
+        self.assertEqual(_resolve_start_index(2, 5), 2)
+
+    def test_minus_one_opens_the_most_recent_snapshot(self) -> None:
+        """What the VS Code camera button passes.
+
+        It captures first and launches the viewer afterwards, so the
+        snapshot the user just asked for is the last one in the file.
+        """
+        self.assertEqual(_resolve_start_index(-1, 5), 4)
+
+    def test_negative_indices_count_back_from_the_end(self) -> None:
+        self.assertEqual(_resolve_start_index(-3, 5), 2)
+
+    def test_out_of_range_values_clamp(self) -> None:
+        """The client cannot know the count at launch time.
+
+        Clamping beats refusing to open the viewer.
+        """
+        self.assertEqual(_resolve_start_index(99, 5), 4)
+        self.assertEqual(_resolve_start_index(-99, 5), 0)
+
+    def test_single_snapshot_file_resolves_minus_one_to_zero(self) -> None:
+        self.assertEqual(_resolve_start_index(-1, 1), 0)
+
+    def test_non_numeric_values_fall_back_to_the_first_snapshot(self) -> None:
+        """A hand-edited launch.json must not break the viewer."""
+        for bogus in ("latest", [], {}, object()):
+            with self.subTest(value=bogus):
+                self.assertEqual(_resolve_start_index(bogus, 5), 0)
+
+    def test_booleans_are_not_treated_as_indices(self) -> None:
+        """``True`` is an ``int`` in Python; reject it explicitly."""
+        self.assertEqual(_resolve_start_index(True, 5), 0)
+        self.assertEqual(_resolve_start_index(False, 5), 0)
 
 
 if __name__ == "__main__":

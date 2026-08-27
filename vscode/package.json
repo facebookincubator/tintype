@@ -108,6 +108,10 @@
                 "type": "string",
                 "description": "Absolute path to the .pytb snapshot file."
               },
+              "snapshotIndex": {
+                "type": "number",
+                "description": "Index of the snapshot to open. Negative values count from the end, so -1 opens the most recent snapshot. Out-of-range values are clamped. Defaults to the first snapshot."
+              },
               "cwd": {
                 "type": "string",
                 "description": "Working directory used to resolve source paths."
@@ -119,6 +123,10 @@
               "pytbPath": {
                 "type": "string",
                 "description": "Absolute path to the .pytb snapshot file."
+              },
+              "snapshotIndex": {
+                "type": "number",
+                "description": "Index of the snapshot to open. Negative values count from the end, so -1 opens the most recent snapshot. Out-of-range values are clamped. Defaults to the first snapshot."
               },
               "cwd": {
                 "type": "string",

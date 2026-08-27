@@ -305,15 +305,16 @@ class SnapshotDebugSession:
         # ``handle_threads`` tolerates ``_current_snapshot is None``
         # for the same reason.
         if reader.snapshot_count() > 0:
-            # Load the first snapshot. ``initialized`` is what tells VS Code
+            # Load the requested snapshot. ``initialized`` is what tells VS Code
             # it can start sending configuration requests (breakpoints,
             # exception filters, etc.); send it before ``stopped`` so the
             # client is ready. ``_load_snapshot`` emits the single
             # ``process`` event for this session — VS Code bakes
             # ``body.name`` into the CALL STACK sub-line at launch time and
             # ignores later emissions, so we only emit once.
-            start_index = int(arguments.get("snapshotIndex") or 0)
-            start_index = max(0, min(start_index, reader.snapshot_count() - 1))
+            start_index = _resolve_start_index(
+                arguments.get("snapshotIndex"), reader.snapshot_count()
+            )
             self._load_snapshot(start_index)
 
             self._emit_thread_events_started()
@@ -1557,6 +1558,31 @@ def _scope_sort_key(name: str) -> tuple[int, str]:
     if name.startswith("_"):
         return (2, name.lower())
     return (1, name.lower())
+
+
+def _resolve_start_index(raw: object, snapshot_count: int) -> int:
+    """Resolve the ``snapshotIndex`` launch argument to a real index.
+
+    Negative values index from the end, Python-style, so ``-1`` opens
+    the most recent snapshot. That is what the VS Code camera button
+    passes: it captures first and then launches the viewer, and the
+    snapshot the user just asked for is the last one in the file.
+
+    Out-of-range values clamp rather than error — the caller usually
+    cannot know the count at launch time, and refusing to open the
+    viewer is a worse outcome than landing on an edge snapshot. A
+    missing or non-numeric value opens the first snapshot, preserving
+    the behaviour clients that predate this argument rely on.
+    """
+    if raw is None or isinstance(raw, bool):
+        return 0
+    try:
+        index = int(raw)  # pyre-ignore[6]: guarded by the TypeError catch
+    except (TypeError, ValueError):
+        return 0
+    if index < 0:
+        index += snapshot_count
+    return max(0, min(index, snapshot_count - 1))
 
 
 def _pick_stop_thread(
