@@ -74,6 +74,18 @@ DEFAULT_EXCLUDE_FRAME_PATHS: list[str] = [
     r"/debugpy[_/]",
     r"/_pydev_",
     r"/pydev_ipython/",
+    # Tintype's own VS Code integration helpers. ``capture()`` and
+    # friends are dispatched through a debugpy ``evaluate``, so
+    # ``snapshot_all_threads()`` records the very thread performing the
+    # capture, with ``vscode.py`` on top of the pydevd command-thread
+    # stack. Every other frame in that thread is already matched here,
+    # so without this pattern :meth:`TintypeDebugSession._is_filtered_thread`
+    # sees one unfiltered frame, keeps the service thread in the threads
+    # list, and :func:`_pick_stop_thread` lands the user on tintype's
+    # internals instead of their own code. Directory-anchored so a user
+    # module named ``vscode.py`` outside a ``tintype`` package is
+    # unaffected.
+    r"/tintype/vscode\.py$",
     # ``threading.Thread.__init__`` and ``Thread._bootstrap*`` frames
     # bracket every real user thread; they're part of the CPython
     # stdlib plumbing, not the user's call stack. Anchor on the

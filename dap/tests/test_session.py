@@ -1035,6 +1035,91 @@ class SessionHandlerTest(unittest.TestCase):
         self.assertEqual(hints[1], "subtle")
         self.assertEqual(hints[2], "subtle")
 
+    def test_capture_thread_is_filtered_out_of_the_threads_list(self) -> None:
+        """The thread performing the capture must not surface at all.
+
+        ``capture()`` is dispatched through a debugpy ``evaluate``, so
+        ``snapshot_all_threads()`` records pydevd's command thread with
+        ``tintype/vscode.py`` on top. Reproduces the real stack observed
+        under ``meta-python``: every frame below frame 0 was already
+        filtered, so a single unfiltered ``vscode.py`` frame was enough
+        to keep the service thread in the threads list and make it the
+        ``stopped`` target — landing the user in tintype's internals
+        instead of their own code.
+        """
+        capture_thread = _make_stacktrace(
+            200,
+            [
+                _make_frame(
+                    "/tmp/tintype_runtimes/cpython-312/tintype/vscode.py",
+                    "capture",
+                    83,
+                    {},
+                ),
+                _make_frame("<string>", "<module>", 1, {}),
+                _make_frame(
+                    "/x/debugpy/_vendored/pydevd/_pydevd_bundle/pydevd_vars.py",
+                    "evaluate_expression",
+                    577,
+                    {},
+                ),
+                _make_frame(
+                    "/x/debugpy/_vendored/pydevd/pydevd.py",
+                    "process_internal_commands",
+                    1911,
+                    {},
+                ),
+                _make_frame(
+                    "/home/u/.conda/envs/e/lib/python3.12/threading.py",
+                    "_bootstrap",
+                    1032,
+                    {},
+                ),
+            ],
+            thread_name="Thread 200",
+        )
+        user_thread = _make_stacktrace(
+            201,
+            [_make_frame("/app/empty_script.py", "main", 11, {"x": 22})],
+            thread_name="MainThread",
+        )
+        # Capture thread first, mirroring the observed insertion order.
+        # ``_pick_stop_thread`` falls back to the first thread, which is
+        # what made the bug user-visible.
+        snap = _make_snapshot([capture_thread, user_thread])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(self.session, self.dispatcher, seq=700, command="threads")
+        threads = _drain_messages(self.stream)[0]["body"]["threads"]
+
+        self.assertEqual(
+            [t["id"] for t in threads],
+            [201],
+            "the capture thread should be filtered out of the threads list",
+        )
+
+    def test_user_module_named_vscode_py_is_not_filtered(self) -> None:
+        """The ``/tintype/`` anchor must not catch a user's own file."""
+        user_frame = _make_frame("/app/vscode.py", "main", 10, {})
+        st = _make_stacktrace(100, [user_frame], thread_name="MainThread")
+        snap = _make_snapshot([st])
+        self._launch_with_snapshots([snap])
+
+        self.stream.seek(0)
+        self.stream.truncate()
+        _send_request(
+            self.session,
+            self.dispatcher,
+            seq=701,
+            command="stackTrace",
+            arguments={"threadId": 100},
+        )
+        frames = _drain_messages(self.stream)[0]["body"]["stackFrames"]
+
+        self.assertEqual([f["presentationHint"] for f in frames], ["normal"])
+
     def test_hide_filtered_frames_drops_them_from_stack(self) -> None:
         """``hideFilteredFrames: true`` removes matching frames entirely."""
         user_frame = _make_frame("/app/main.py", "main", 10, {})
