@@ -14,6 +14,26 @@ import {SnapshotTreeProvider, TreeElement} from './snapshot-tree-provider';
 export * from './snapshot-provider';
 export * from './snapshot-tree-provider';
 
+/**
+ * DAP requests that leave the debuggee running, so a capture scheduled
+ * against the current stop must be dropped. ``restartFrame`` and ``goto``
+ * are included because both resume execution even though neither reads
+ * as a "continue" at the UI level.
+ */
+const RESUME_COMMANDS: ReadonlySet<string> = new Set([
+  'continue',
+  'next',
+  'stepIn',
+  'stepOut',
+  'stepBack',
+  'reverseContinue',
+  'restartFrame',
+  'goto',
+  'restart',
+  'disconnect',
+  'terminate',
+]);
+
 export type SnapshotProviderRegistration = {
   disposable: vscode.Disposable;
   provider: SnapshotProvider;
@@ -60,7 +80,54 @@ export function registerSnapshotProvider({
   snapshot.setTreeProvider(treeProvider);
   treeProvider.bind(() => snapshot.getViewerSummaries());
 
+  // Automatic capture-on-stop. Registered only when the host opted in,
+  // so hosts without the settings pay nothing for the extra tracker.
+  // A ``stopped`` event on the live parent covers breakpoint hits,
+  // exceptions, pause, and step completion alike; the provider decides
+  // per event whether the user has the setting enabled.
+  const autoSnapshotTrackers =
+    hostOptions?.resolveAutoSnapshotConfig == null
+      ? []
+      : (typeof injectionDebugType === 'string' ? [injectionDebugType] : injectionDebugType).map(
+          debugType =>
+            vscode.debug.registerDebugAdapterTrackerFactory(debugType, {
+              createDebugAdapterTracker(session: vscode.DebugSession) {
+                return {
+                  // Watch outgoing *requests* rather than relying on the
+                  // ``continued`` event: DAP lets an adapter omit that
+                  // event when the resume was request-initiated, which
+                  // is exactly the stepping case we must not miss. A
+                  // scheduled capture that fired after the debuggee
+                  // resumed would evaluate against a running thread and
+                  // fail instead of capturing.
+                  onWillReceiveMessage(message: {type?: string; command?: string}) {
+                    if (
+                      message.type === 'request' &&
+                      message.command != null &&
+                      RESUME_COMMANDS.has(message.command)
+                    ) {
+                      snapshot.cancelPendingAutoSnapshot(session);
+                    }
+                  },
+                  onDidSendMessage(message: {type?: string; event?: string}) {
+                    if (message.type !== 'event') {
+                      return;
+                    }
+                    if (message.event === 'stopped') {
+                      void snapshot.handleParentStopped(session);
+                    } else if (message.event === 'continued') {
+                      // Adapter-initiated resume (e.g. another client
+                      // continued the session).
+                      snapshot.cancelPendingAutoSnapshot(session);
+                    }
+                  },
+                };
+              },
+            }),
+        );
+
   const disposable = vscode.Disposable.from(
+    ...autoSnapshotTrackers,
     vscode.commands.registerCommand(takeCommand, () => snapshot.takeSnapshot()),
     // ``jumpCommand`` is always invoked via the tree item's command, which
     // owns both arguments (viewerId, index). Third-party callers can still
@@ -135,7 +202,12 @@ export function registerSnapshotProvider({
     vscode.debug.onDidChangeActiveDebugSession((session: vscode.DebugSession | undefined) =>
       snapshot.handleChangeActiveSession(session),
     ),
-    {dispose: () => treeProvider.dispose()},
+    {
+      dispose: () => {
+        snapshot.dispose();
+        treeProvider.dispose();
+      },
+    },
   );
 
   return {disposable, provider: snapshot};

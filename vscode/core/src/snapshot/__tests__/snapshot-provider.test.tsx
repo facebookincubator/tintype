@@ -9,7 +9,15 @@
 
 import type vscode from 'vscode';
 import cryptoModuleImport from 'crypto';
-import {__testOnly_generateLaunchToken, SnapshotProvider} from '../snapshot-provider';
+import {
+  __testOnly_generateLaunchToken,
+  createAutoSnapshotConfigResolver,
+  DEFAULT_AUTO_SNAPSHOT_SETTLE_MS,
+  DEFAULT_AUTO_SNAPSHOT_TIMEOUT_MS,
+  SnapshotProvider,
+  type AutoSnapshotConfig,
+  type SnapshotTelemetrySink,
+} from '../snapshot-provider';
 import {SnapshotTreeProvider} from '../snapshot-tree-provider';
 
 const mockExecuteCommand = jest.fn();
@@ -19,6 +27,7 @@ const mockShowWarningMessage = jest.fn();
 const mockShowSaveDialog = jest.fn();
 const mockStartDebugging = jest.fn();
 const mockFsStat = jest.fn();
+const mockGetConfiguration = jest.fn();
 
 type StartDebuggingCall = [workspaceFolder: unknown, config: Record<string, unknown>];
 
@@ -49,6 +58,7 @@ jest.mock('vscode', () => ({
     fs: {
       stat: (uri: unknown): Promise<unknown> => mockFsStat(uri) as Promise<unknown>,
     },
+    getConfiguration: (...args: unknown[]): unknown => mockGetConfiguration(...args) as unknown,
   },
   commands: {
     executeCommand: (...args: unknown[]): unknown => mockExecuteCommand(...args) as unknown,
@@ -1291,6 +1301,574 @@ describe('SnapshotProvider', () => {
       expect(mockExecuteCommand).toHaveBeenCalledWith('setContext', CONTEXT_KEY, false);
     });
   });
+});
+
+describe('handleParentStopped', () => {
+  let telemetry: {logEvent: jest.Mock; logError: jest.Mock} & SnapshotTelemetrySink;
+  let autoSnapshotConfig: AutoSnapshotConfig;
+  let consoleWarn: jest.SpyInstance;
+
+  function createProvider(options: {withResolver?: boolean} = {}): SnapshotProvider {
+    const provider = new SnapshotProvider(INJECTION_TYPE, VIEWER_TYPE, 'test-host', {
+      telemetry,
+      resolveAutoSnapshotConfig:
+        options.withResolver === false ? undefined : () => autoSnapshotConfig,
+    });
+    provider.setTreeProvider(new SnapshotTreeProvider(JUMP_COMMAND));
+    return provider;
+  }
+
+  /**
+   * A parent whose ``evaluate`` rejects for the expressions ``shouldFail``
+   * matches, and otherwise behaves like a healthy debuggee.
+   */
+  function createCaptureFailingParent(
+    shouldFail: (expression: string) => boolean,
+    error: Error,
+  ): MockSession {
+    const healthy = createParentSession();
+    const delegate = healthy.customRequest as unknown as jest.Mock<unknown>;
+    const customRequest = jest
+      .fn()
+      .mockImplementation((command: string, args?: {expression?: string}) => {
+        if (command === 'evaluate' && shouldFail(args?.expression ?? '')) {
+          return Promise.reject(error);
+        }
+        return delegate(command, args) as unknown;
+      });
+    return {
+      ...healthy,
+      customRequest: customRequest as unknown as vscode.DebugSession['customRequest'],
+    };
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockActiveDebugSession = null;
+    mockStartDebugging.mockResolvedValue(true);
+    telemetry = {logEvent: jest.fn(), logError: jest.fn()};
+    autoSnapshotConfig = {enabled: true, timeoutMs: 5000, settleMs: 0};
+    consoleWarn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleWarn.mockRestore();
+  });
+
+  it('captures with the configured deadline, converted to seconds', async () => {
+    autoSnapshotConfig = {enabled: true, timeoutMs: 250, settleMs: 0};
+    const provider = createProvider();
+    const parent = createParentSession();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+    // The deadline is enforced inside the debuggee, not by racing the
+    // DAP request from here.
+    expect(captureCalls(parent)).toEqual([
+      "__import__('tintype.vscode', fromlist=['capture']).capture(timeout=0.25)",
+    ]);
+  });
+
+  // A viewer reports ``stopped`` and the tintype adapter never sends
+  // ``continued``, so VS Code treats a live viewer as permanently
+  // stopped and steals focus onto it whenever the program under test
+  // resumes for a perceptible interval. Recording must therefore never
+  // open one.
+  it('never launches a viewer debug session', async () => {
+    const provider = createProvider();
+    const parent = createParentSession();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+    expect(captureCalls(parent)).toHaveLength(2);
+    expect(mockStartDebugging).not.toHaveBeenCalled();
+  });
+
+  it('still refreshes a viewer the user opened themselves', async () => {
+    const parent = createParentSession();
+    const childCustom = jest.fn().mockResolvedValue({
+      currentIndex: 0,
+      snapshots: [{index: 0, timestampUs: 1_000_000}],
+    });
+    // ``primeViewer`` runs the manual camera-button flow, which is the
+    // only thing allowed to spawn a viewer.
+    const provider = createProvider();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+    mockActiveDebugSession = parent;
+    await provider.takeSnapshot();
+    const config = (mockStartDebugging.mock.calls.slice(-1)[0] as StartDebuggingCall)[1];
+    const child = childSessionFromConfig('child-manual', config, childCustom);
+    provider.handleStartSession(child as unknown as vscode.DebugSession);
+    await Promise.resolve();
+    await Promise.resolve();
+    mockStartDebugging.mockClear();
+    childCustom.mockClear();
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+    // No second viewer, but the open one is brought up to date.
+    expect(mockStartDebugging).not.toHaveBeenCalled();
+    expect(childCustom).toHaveBeenCalledWith('tintypeSnapshotList');
+  });
+
+  it('lets the camera button open a viewer after automatic captures have run', async () => {
+    const provider = createProvider();
+    const parent = createParentSession();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+    expect(mockStartDebugging).not.toHaveBeenCalled();
+
+    // Initialization already happened without a viewer; the manual path
+    // must notice none exists and spawn one rather than assuming init
+    // left one behind.
+    mockActiveDebugSession = parent;
+    await provider.takeSnapshot();
+
+    expect(mockStartDebugging).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves manual snapshots uncapped', async () => {
+    const provider = createProvider();
+    const parent = createParentSession();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+    mockActiveDebugSession = parent;
+
+    await provider.takeSnapshot();
+
+    expect(captureCalls(parent)).toEqual([
+      "__import__('tintype.vscode', fromlist=['capture']).capture()",
+    ]);
+  });
+
+  it('falls back to an uncapped capture when tintype predates the timeout parameter', async () => {
+    autoSnapshotConfig = {enabled: true, timeoutMs: 500, settleMs: 0};
+    const provider = createProvider();
+    const parent = createCaptureFailingParent(
+      expression => expression.includes('capture(timeout='),
+      new Error("capture() got an unexpected keyword argument 'timeout'"),
+    );
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+    expect(captureCalls(parent)).toEqual([
+      "__import__('tintype.vscode', fromlist=['capture']).capture(timeout=0.5)",
+      "__import__('tintype.vscode', fromlist=['capture']).capture()",
+    ]);
+    // The degraded capture succeeded, so the user must not see an error.
+    expect(mockShowErrorMessage).not.toHaveBeenCalled();
+
+    // The probe result is remembered — the next stop skips the doomed
+    // timeout attempt entirely.
+    (parent.customRequest as unknown as jest.Mock<unknown>).mockClear();
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+    expect(captureCalls(parent)).toEqual([
+      "__import__('tintype.vscode', fromlist=['capture']).capture()",
+    ]);
+  });
+
+  describe('failure latch', () => {
+    /** A parent whose tintype runtime never initializes. */
+    function createUninitializableParent(): MockSession {
+      return createCaptureFailingParent(
+        expression => expression.includes('session_info'),
+        new Error("No module named 'tintype'"),
+      );
+    }
+
+    it('disables auto-capture for the session after the first failure', async () => {
+      const provider = createProvider();
+      const parent = createUninitializableParent();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      const callsAfterFirstStop = (parent.customRequest as unknown as jest.Mock<unknown>).mock.calls
+        .length;
+      expect(callsAfterFirstStop).toBeGreaterThan(0);
+
+      // Every later stop must be free: no re-running the injection
+      // sequence against the paused thread. Sequential on purpose —
+      // these stand in for successive stops, not concurrent ones.
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+      expect((parent.customRequest as unknown as jest.Mock<unknown>).mock.calls).toHaveLength(
+        callsAfterFirstStop,
+      );
+    });
+
+    it('warns exactly once, naming the cause', async () => {
+      const provider = createProvider();
+      const parent = createUninitializableParent();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("No module named 'tintype'"),
+      );
+    });
+
+    it('never shows the per-stop error toast for automatic captures', async () => {
+      const provider = createProvider();
+      const parent = createUninitializableParent();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
+    });
+
+    it('leaves the manual camera button working, and still reports its errors', async () => {
+      const provider = createProvider();
+      const parent = createUninitializableParent();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      mockShowErrorMessage.mockClear();
+
+      mockActiveDebugSession = parent;
+      await provider.takeSnapshot();
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining('Tintype snapshot failed'),
+      );
+    });
+
+    it('does not latch a session whose captures succeed', async () => {
+      const provider = createProvider();
+      const parent = createParentSession();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+      expect(captureCalls(parent)).toHaveLength(2);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it('latches per session, not globally', async () => {
+      const provider = createProvider();
+      const broken = createUninitializableParent();
+      const healthy = createParentSession({id: 'parent-healthy'});
+      provider.handleStartSession(broken as unknown as vscode.DebugSession);
+      provider.handleStartSession(healthy as unknown as vscode.DebugSession);
+
+      await provider.handleParentStopped(broken as unknown as vscode.DebugSession);
+      await provider.handleParentStopped(healthy as unknown as vscode.DebugSession);
+
+      expect(captureCalls(healthy)).toHaveLength(1);
+    });
+  });
+
+  it('reports a genuine capture failure instead of retrying it uncapped', async () => {
+    autoSnapshotConfig = {enabled: true, timeoutMs: 500, settleMs: 0};
+    const provider = createProvider();
+    const parent = createCaptureFailingParent(
+      expression => expression.includes('capture('),
+      new Error('RuntimeError: snapshot backend unavailable'),
+    );
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+    expect(captureCalls(parent)).toEqual([
+      "__import__('tintype.vscode', fromlist=['capture']).capture(timeout=0.5)",
+    ]);
+    expect(telemetry.logError).toHaveBeenCalledWith(
+      parent,
+      expect.any(Error),
+      'takeSnapshot',
+      'takeSnapshotError',
+      expect.objectContaining({variant: 'autoSnapshot'}),
+    );
+  });
+
+  it('does nothing when the setting is disabled', async () => {
+    autoSnapshotConfig = {enabled: false, timeoutMs: 5000, settleMs: 0};
+    const provider = createProvider();
+    const parent = createParentSession();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+    expect(parent.customRequest).not.toHaveBeenCalled();
+    expect(mockStartDebugging).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when the host did not opt in', async () => {
+    const provider = createProvider({withResolver: false});
+    const parent = createParentSession();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+    expect(parent.customRequest).not.toHaveBeenCalled();
+  });
+
+  it('ignores stopped events from sessions of an unrelated debug type', async () => {
+    const provider = createProvider();
+    const unrelated: MockSession = {
+      id: 'node-1',
+      type: 'node',
+      name: 'Node',
+      customRequest: jest.fn() as unknown as vscode.DebugSession['customRequest'],
+      workspaceFolder: undefined,
+      configuration: {type: 'node', name: 'Node', request: 'launch'},
+    };
+
+    await provider.handleParentStopped(unrelated as unknown as vscode.DebugSession);
+
+    expect(unrelated.customRequest).not.toHaveBeenCalled();
+  });
+
+  it('re-reads the config on every stop so toggling the setting takes effect immediately', async () => {
+    const provider = createProvider();
+    const parent = createParentSession();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+    expect(captureCalls(parent)).toHaveLength(1);
+
+    autoSnapshotConfig = {enabled: false, timeoutMs: 5000, settleMs: 0};
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+    expect(captureCalls(parent)).toHaveLength(1);
+  });
+
+  /**
+   * A debuggee that never answers. The in-debuggee deadline can't help
+   * here (the DAP round-trip itself is stuck), so this exercises the
+   * overlap guard, which is the layer that keeps a wedged session from
+   * accumulating one queued capture per step.
+   */
+  function createHangingParent(id?: string): {
+    parent: MockSession;
+    customRequest: jest.Mock<unknown>;
+  } {
+    const customRequest = jest.fn().mockImplementation(() => new Promise(() => {}));
+    return {
+      parent: {
+        ...createParentSession({id}),
+        customRequest: customRequest as unknown as vscode.DebugSession['customRequest'],
+      },
+      customRequest,
+    };
+  }
+
+  /** Let a ``setTimeout(0)`` scheduled before this call run. */
+  const tick = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
+
+  it('skips stops that overlap a capture still in flight', async () => {
+    const provider = createProvider();
+    const {parent, customRequest} = createHangingParent();
+    provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+    void provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+    await tick();
+    expect(customRequest).toHaveBeenCalled();
+
+    customRequest.mockClear();
+    await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+    expect(customRequest).not.toHaveBeenCalled();
+  });
+
+  it('keeps sessions independent — one stalled parent does not block another', async () => {
+    const provider = createProvider();
+    const {parent: stalled} = createHangingParent('parent-stalled');
+    const healthy = createParentSession({id: 'parent-healthy'});
+    provider.handleStartSession(stalled as unknown as vscode.DebugSession);
+    provider.handleStartSession(healthy as unknown as vscode.DebugSession);
+
+    void provider.handleParentStopped(stalled as unknown as vscode.DebugSession);
+    await provider.handleParentStopped(healthy as unknown as vscode.DebugSession);
+
+    expect(captureCalls(healthy)).toHaveLength(1);
+  });
+
+  describe('settle delay', () => {
+    // Long enough that the timer cannot fire during the test, so these
+    // assert cancellation rather than racing a real delay.
+    const NEVER_FIRES_MS = 10_000;
+
+    it('captures once the session has stayed stopped for the settle delay', async () => {
+      autoSnapshotConfig = {enabled: true, timeoutMs: 5000, settleMs: 20};
+      const provider = createProvider();
+      const parent = createParentSession();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      await provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+
+      expect(captureCalls(parent)).toHaveLength(1);
+    });
+
+    it('takes no snapshot while the user keeps stepping', async () => {
+      autoSnapshotConfig = {enabled: true, timeoutMs: 5000, settleMs: NEVER_FIRES_MS};
+      const provider = createProvider();
+      const parent = createParentSession();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      // Three stops in quick succession: each supersedes the last, so
+      // nothing is ever dispatched to the paused thread.
+      const stops = [
+        provider.handleParentStopped(parent as unknown as vscode.DebugSession),
+        provider.handleParentStopped(parent as unknown as vscode.DebugSession),
+        provider.handleParentStopped(parent as unknown as vscode.DebugSession),
+      ];
+      // The superseded schedules must resolve rather than hang.
+      await Promise.all(stops.slice(0, 2));
+      provider.cancelPendingAutoSnapshot(parent as unknown as vscode.DebugSession);
+      await stops[2];
+
+      expect(parent.customRequest).not.toHaveBeenCalled();
+    });
+
+    it('drops the scheduled capture when the session resumes', async () => {
+      autoSnapshotConfig = {enabled: true, timeoutMs: 5000, settleMs: NEVER_FIRES_MS};
+      const provider = createProvider();
+      const parent = createParentSession();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      const pending = provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      provider.cancelPendingAutoSnapshot(parent as unknown as vscode.DebugSession);
+      await pending;
+
+      expect(parent.customRequest).not.toHaveBeenCalled();
+    });
+
+    it('drops the scheduled capture when the session terminates', async () => {
+      autoSnapshotConfig = {enabled: true, timeoutMs: 5000, settleMs: NEVER_FIRES_MS};
+      const provider = createProvider();
+      const parent = createParentSession();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      const pending = provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      provider.handleTerminateSession(parent as unknown as vscode.DebugSession);
+      await pending;
+
+      expect(parent.customRequest).not.toHaveBeenCalled();
+    });
+
+    it('drops scheduled captures on dispose', async () => {
+      autoSnapshotConfig = {enabled: true, timeoutMs: 5000, settleMs: NEVER_FIRES_MS};
+      const provider = createProvider();
+      const parent = createParentSession();
+      provider.handleStartSession(parent as unknown as vscode.DebugSession);
+
+      const pending = provider.handleParentStopped(parent as unknown as vscode.DebugSession);
+      provider.dispose();
+      await pending;
+
+      expect(parent.customRequest).not.toHaveBeenCalled();
+    });
+
+    it('cancelling with nothing scheduled is a no-op', () => {
+      const provider = createProvider();
+      const parent = createParentSession();
+
+      expect(() =>
+        provider.cancelPendingAutoSnapshot(parent as unknown as vscode.DebugSession),
+      ).not.toThrow();
+    });
+  });
+});
+
+describe('createAutoSnapshotConfigResolver', () => {
+  const session = {
+    workspaceFolder: {uri: {fsPath: '/repo'}},
+  } as unknown as vscode.DebugSession;
+
+  function stubSettings(values: Record<string, unknown>): void {
+    mockGetConfiguration.mockReturnValue({
+      get: (key: string, fallback: unknown) => (key in values ? values[key] : fallback),
+    });
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('reads the requested section, scoped to the session workspace folder', () => {
+    stubSettings({
+      autoSnapshotOnStop: true,
+      autoSnapshotTimeoutMs: 250,
+      autoSnapshotSettleMs: 750,
+    });
+
+    const config = createAutoSnapshotConfigResolver('python-debugger.tintype')(session);
+
+    expect(mockGetConfiguration).toHaveBeenCalledWith('python-debugger.tintype', {fsPath: '/repo'});
+    expect(config).toEqual({enabled: true, timeoutMs: 250, settleMs: 750});
+  });
+
+  it('defaults to disabled with the shared default timings', () => {
+    stubSettings({});
+
+    expect(createAutoSnapshotConfigResolver('tintype')(session)).toEqual({
+      enabled: false,
+      timeoutMs: DEFAULT_AUTO_SNAPSHOT_TIMEOUT_MS,
+      settleMs: DEFAULT_AUTO_SNAPSHOT_SETTLE_MS,
+    });
+  });
+
+  // Unlike a zero-length capture budget, "no delay" is a coherent
+  // request: snapshot on every stop and accept the step latency.
+  it('honours a settle delay of 0 as capture-on-every-stop', () => {
+    stubSettings({autoSnapshotOnStop: true, autoSnapshotSettleMs: 0});
+
+    expect(createAutoSnapshotConfigResolver('tintype')(session).settleMs).toBe(0);
+  });
+
+  for (const [label, autoSnapshotSettleMs] of [
+    ['negative', -1],
+    ['not a number', 'later'],
+    ['NaN', Number.NaN],
+    ['infinite', Number.POSITIVE_INFINITY],
+  ] as Array<[string, unknown]>) {
+    it(`falls back to the default settle delay when it is ${label}`, () => {
+      stubSettings({autoSnapshotOnStop: true, autoSnapshotSettleMs});
+
+      expect(createAutoSnapshotConfigResolver('tintype')(session).settleMs).toBe(
+        DEFAULT_AUTO_SNAPSHOT_SETTLE_MS,
+      );
+    });
+  }
+
+  // Very short budgets are honoured, not clamped: tintype cancels
+  // mid-walk and keeps the frames it completed. Its own suite asserts a
+  // non-empty snapshot at 50ms (``tests/test_cancellation.py`` and
+  // ``tests/test_all_threads.py``), so imposing a floor here would
+  // override a working configuration.
+  it.each([1, 50, 99])('honours a short timeout of %ims as configured', timeoutMs => {
+    stubSettings({autoSnapshotOnStop: true, autoSnapshotTimeoutMs: timeoutMs});
+
+    expect(createAutoSnapshotConfigResolver('tintype')(session).timeoutMs).toBe(timeoutMs);
+  });
+
+  // Not a duration at all: the pybind signatures forward the double
+  // through unvalidated, so these have no defined meaning downstream.
+  const nonDurations: Array<[string, unknown]> = [
+    ['zero', 0],
+    ['negative', -1],
+    ['not a number', 'soon'],
+    ['NaN', Number.NaN],
+    ['infinite', Number.POSITIVE_INFINITY],
+  ];
+  for (const [label, autoSnapshotTimeoutMs] of nonDurations) {
+    it(`falls back to the default when the timeout is ${label}`, () => {
+      stubSettings({autoSnapshotOnStop: true, autoSnapshotTimeoutMs});
+
+      expect(createAutoSnapshotConfigResolver('tintype')(session).timeoutMs).toBe(
+        DEFAULT_AUTO_SNAPSHOT_TIMEOUT_MS,
+      );
+    });
+  }
 });
 
 describe('generateLaunchToken', () => {

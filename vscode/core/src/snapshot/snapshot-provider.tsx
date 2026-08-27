@@ -80,9 +80,115 @@ export type CaptureRuntimePreparation = (
   evaluate: SnapshotEvaluator,
 ) => Promise<void>;
 
+/** Entry point a capture was requested from. Recorded on telemetry. */
+export type SnapshotTriggerVariant = 'takeSnapshot' | 'takeSnapshotOnParent' | 'autoSnapshot';
+
+export type AutoSnapshotConfig = {
+  enabled: boolean;
+  /**
+   * Deadline handed to ``tintype.vscode.capture()``. Enforced inside the
+   * debuggee, which truncates the snapshot on expiry rather than running
+   * to completion — see :meth:`SnapshotProvider.handleParentStopped`.
+   */
+  timeoutMs: number;
+  /**
+   * How long the session must sit stopped before a capture starts. ``0``
+   * captures immediately on every stop.
+   */
+  settleMs: number;
+};
+
+/**
+ * Resolved per stop rather than cached so toggling the setting takes
+ * effect on the next step instead of requiring a session restart, and
+ * so hosts can scope the lookup to the session's workspace folder.
+ */
+export type AutoSnapshotConfigResolver = (session: vscode.DebugSession) => AutoSnapshotConfig;
+
+/** Setting leaf names shared by every host, so the two `package.json`
+ * contributions and the defaults below cannot drift apart. */
+export const AUTO_SNAPSHOT_ENABLED_SETTING = 'autoSnapshotOnStop';
+export const AUTO_SNAPSHOT_TIMEOUT_SETTING = 'autoSnapshotTimeoutMs';
+export const AUTO_SNAPSHOT_SETTLE_SETTING = 'autoSnapshotSettleMs';
+
+/**
+ * The capture runs on the paused thread, so the next step request can't
+ * be serviced until it returns. The settle delay means that normally
+ * happens while the user is reading rather than stepping; this deadline
+ * only bounds the case where they resume right as a capture begins, so
+ * it is deliberately well under tintype's own 1s library default.
+ */
+export const DEFAULT_AUTO_SNAPSHOT_TIMEOUT_MS = 250;
+
+/**
+ * Long enough to sit out a burst of held-down stepping, short enough
+ * that pausing to look at a line still yields a snapshot. A judgement
+ * call, not a measurement — hence the setting.
+ */
+export const DEFAULT_AUTO_SNAPSHOT_SETTLE_MS = 500;
+
+/**
+ * Build a resolver that reads the auto-snapshot settings out of
+ * ``section``. Hosts differ only in the section they contribute them
+ * under (``tintype`` vs ``python-debugger.tintype``).
+ *
+ * Any positive timeout is honoured as configured. Very short budgets are
+ * genuinely useful — tintype cancels mid-walk and keeps the frames it
+ * already completed, and its own tests assert a non-empty snapshot at
+ * 50ms even against locals whose ``__repr__`` sleeps 200ms. There is no
+ * floor to impose beyond rejecting values that aren't a duration at all:
+ * the pybind signatures forward the ``double`` straight through with no
+ * validation, so a hand-edited ``NaN`` / ``0`` / negative has no defined
+ * behaviour and is treated here as "unset".
+ *
+ * ``settleMs`` accepts ``0`` where ``timeoutMs`` does not: no delay is a
+ * meaningful choice (capture on every stop, trading step latency for a
+ * denser timeline), whereas a zero-length capture budget is not.
+ */
+export function createAutoSnapshotConfigResolver(section: string): AutoSnapshotConfigResolver {
+  return (session: vscode.DebugSession) => {
+    const config = vscode.workspace.getConfiguration(section, session.workspaceFolder?.uri);
+    const timeoutMs = config.get<number>(
+      AUTO_SNAPSHOT_TIMEOUT_SETTING,
+      DEFAULT_AUTO_SNAPSHOT_TIMEOUT_MS,
+    );
+    const settleMs = config.get<number>(
+      AUTO_SNAPSHOT_SETTLE_SETTING,
+      DEFAULT_AUTO_SNAPSHOT_SETTLE_MS,
+    );
+    return {
+      enabled: config.get<boolean>(AUTO_SNAPSHOT_ENABLED_SETTING, false),
+      timeoutMs:
+        Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_AUTO_SNAPSHOT_TIMEOUT_MS,
+      settleMs:
+        Number.isFinite(settleMs) && settleMs >= 0 ? settleMs : DEFAULT_AUTO_SNAPSHOT_SETTLE_MS,
+    };
+  };
+}
+
+const CAPTURE_IMPORT = "__import__('tintype.vscode', fromlist=['capture']).capture";
+const CAPTURE_CALL = `${CAPTURE_IMPORT}()`;
+const CAPTURE_WITH_TIMEOUT_PREFIX = `${CAPTURE_IMPORT}(timeout=`;
+
+/**
+ * Detect the ``TypeError`` a pre-timeout tintype raises for
+ * ``capture(timeout=...)``. Python has used this wording since 3.0, and
+ * the free-threaded / GIL capture paths both surface it verbatim.
+ */
+function isUnexpectedKeywordArgumentError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('unexpected keyword argument');
+}
+
 export type SnapshotProviderHostOptions = {
   prepareCaptureRuntime?: CaptureRuntimePreparation;
   telemetry?: SnapshotTelemetrySink;
+  /**
+   * Omit to leave automatic capture-on-stop unavailable for this host —
+   * :func:`registerSnapshotProvider` then skips the parent-session DAP
+   * tracker entirely.
+   */
+  resolveAutoSnapshotConfig?: AutoSnapshotConfigResolver;
 };
 
 const NOOP_TELEMETRY: SnapshotTelemetrySink = {
@@ -247,9 +353,50 @@ export class SnapshotProvider {
 
   private treeProvider: SnapshotTreeProvider | null = null;
 
+  /**
+   * Parent sessions with an automatic capture still running, keyed by
+   * ``session.id``. Stepping can outrun the capture round-trip, so
+   * overlapping stops are dropped rather than queued — this is what
+   * keeps auto-snapshot from adding unbounded ``evaluate`` traffic
+   * ahead of the user's next step request.
+   */
+  private autoSnapshotInFlight: Set<string> = new Set();
+
+  /**
+   * Captures scheduled by :meth:`handleParentStopped` but not yet fired,
+   * keyed by ``session.id``. ``resolve`` settles the promise that method
+   * handed back, so a cancelled schedule doesn't leave a caller hanging.
+   */
+  private pendingAutoSnapshots: Map<
+    string,
+    {timer: ReturnType<typeof setTimeout>; resolve: () => void}
+  > = new Map();
+
+  /**
+   * Sessions where an automatic capture has failed once and is therefore
+   * switched off for the rest of the session. See :meth:`runAutoSnapshot`.
+   * The manual camera button ignores this and still works.
+   */
+  private autoSnapshotDisabled: Set<string> = new Set();
+
+  /**
+   * Failure from the most recent :meth:`takeSnapshotInternal` call, so
+   * :meth:`runAutoSnapshot` can name the cause when it latches off. The
+   * auto path deliberately swallows the error rather than rethrowing, so
+   * this is how the reason survives.
+   */
+  private lastAutoSnapshotError: Error | undefined;
+
+  /**
+   * Sessions whose tintype package predates the ``capture(timeout=...)``
+   * parameter. Probed once on first failure; see :meth:`requestCapture`.
+   */
+  private captureTimeoutUnsupported: Set<string> = new Set();
+
   private readonly injectionDebugTypes: ReadonlySet<string>;
   private readonly prepareCaptureRuntime: CaptureRuntimePreparation | undefined;
   private readonly telemetry: SnapshotTelemetrySink;
+  private readonly resolveAutoSnapshotConfig: AutoSnapshotConfigResolver | undefined;
 
   constructor(
     injectionDebugType: string | readonly string[],
@@ -262,6 +409,7 @@ export class SnapshotProvider {
     );
     this.prepareCaptureRuntime = hostOptions.prepareCaptureRuntime;
     this.telemetry = hostOptions.telemetry ?? NOOP_TELEMETRY;
+    this.resolveAutoSnapshotConfig = hostOptions.resolveAutoSnapshotConfig;
   }
 
   private supportsLiveSession(session: vscode.DebugSession): boolean {
@@ -346,7 +494,7 @@ export class SnapshotProvider {
   }
 
   public takeSnapshot(session?: vscode.DebugSession): Promise<void> {
-    return this.takeSnapshotInternal(session, 'takeSnapshot');
+    return this.takeSnapshotInternal(session, 'takeSnapshot').then(() => undefined);
   }
 
   /**
@@ -361,7 +509,7 @@ export class SnapshotProvider {
    */
   public async ensureSnapshotting(
     session: vscode.DebugSession,
-    variant: 'takeSnapshot' | 'takeSnapshotOnParent' = 'takeSnapshot',
+    variant: SnapshotTriggerVariant = 'takeSnapshot',
     options: {launchViewer?: boolean} = {},
   ): Promise<void> {
     if (this.injectedSessions.has(session.id)) {
@@ -456,21 +604,31 @@ export class SnapshotProvider {
   }
 
   /**
-   * Shared implementation for the two toolbar entry points that take
-   * a snapshot (``Take Snapshot`` on the parent's CALL STACK and
-   * ``Take Snapshot on Parent`` on the viewer's toolbar). ``variant``
-   * disambiguates the two on the resulting telemetry event.
+   * Shared implementation for the entry points that take a snapshot:
+   * ``Take Snapshot`` on the parent's CALL STACK, ``Take Snapshot on
+   * Parent`` on the viewer's toolbar, and automatic capture-on-stop.
+   * ``variant`` disambiguates them on the resulting telemetry event.
+   *
+   * Returns whether the snapshot was taken. Failures are always logged
+   * to telemetry, but only *reported* to the user for the two manual
+   * variants: a toast answers an action the user just took, whereas
+   * auto-capture is a passive event and would repeat the toast on every
+   * stop. :meth:`runAutoSnapshot` handles the auto path's reporting.
    */
   private async takeSnapshotInternal(
     session: vscode.DebugSession | undefined,
-    variant: 'takeSnapshot' | 'takeSnapshotOnParent',
-  ): Promise<void> {
+    variant: SnapshotTriggerVariant,
+    timeoutMs?: number,
+  ): Promise<boolean> {
+    const userInitiated = variant !== 'autoSnapshot';
     const debugSession = session ?? vscode.debug.activeDebugSession;
     if (debugSession == null || !this.supportsLiveSession(debugSession)) {
-      void vscode.window.showErrorMessage(
-        'Cannot take snapshot: No active Python debug session found',
-      );
-      return;
+      if (userInitiated) {
+        void vscode.window.showErrorMessage(
+          'Cannot take snapshot: No active Python debug session found',
+        );
+      }
+      return false;
     }
 
     try {
@@ -486,10 +644,7 @@ export class SnapshotProvider {
       // one in the file.
       await this.ensureSnapshotting(debugSession, variant, {launchViewer: false});
 
-      await debugSession.customRequest('evaluate', {
-        expression: "__import__('tintype.vscode', fromlist=['capture']).capture()",
-        context: 'repl',
-      });
+      await this.requestCapture(debugSession, timeoutMs);
 
       // If a live viewer already exists for this parent, just refresh it
       // so the new snapshot appears in the same sidebar group. Spawning a
@@ -514,7 +669,22 @@ export class SnapshotProvider {
           parentSessionType: debugSession.type,
           launchToken: existingViewer.launchToken,
         });
-        return;
+        return true;
+      }
+
+      // Automatic captures never spawn a viewer — the snapshot is now
+      // in the working file, and that is the whole job. Recording is a
+      // passive activity; opening a debug session for it is what pulls
+      // focus off the program being stepped. If a viewer is open the
+      // branch above has already refreshed it live.
+      if (!userInitiated) {
+        this.telemetry.logEvent(debugSession, 'takeSnapshot', {
+          variant,
+          reusedViewer: false,
+          viewerLaunched: false,
+          parentSessionType: debugSession.type,
+        });
+        return true;
       }
 
       // No registered viewer for the current working file. Two cases:
@@ -523,11 +693,12 @@ export class SnapshotProvider {
       //      session hasn't fired ``onDidStartDebugSession`` yet — the
       //      ``startDebugging`` promise resolves before VS Code dispatches
       //      the child-start event, so there's a short window where a
-      //      launch is in flight but not yet in ``viewers``. The pending
-      //      viewer will read the snapshot we just wrote when it
-      //      finishes registering.
-      //   2. The user previously terminated the viewer. We need to
-      //      launch a fresh viewer to host the new snapshot.
+      //      launch is in flight but not yet in ``viewers``. That viewer
+      //      will read the snapshot we just wrote when it finishes
+      //      registering.
+      //   2. No viewer exists: the user terminated the previous one, or
+      //      only automatic captures have run so far and those never
+      //      open one. Launch a fresh viewer to host the new snapshot.
       //
       // ``pendingByLaunchToken`` lets us tell the two apart: an entry
       // means case 1; absence means case 2.
@@ -537,7 +708,7 @@ export class SnapshotProvider {
       if (hasPendingLaunch) {
         // Case 1 — the in-flight launch will pick up the snapshot, and
         // whichever click created it emits its own take-snapshot row.
-        return;
+        return true;
       }
 
       // Case 2 — user terminated the prior viewer. Launch a fresh
@@ -548,7 +719,7 @@ export class SnapshotProvider {
         // Should be unreachable — ``injectedSessions`` is only set after
         // ``parentInjectionState`` is populated — but bail quietly
         // instead of crashing the snapshot take if invariant drifts.
-        return;
+        return true;
       }
       const freshLaunchToken = await this.launchViewerFor(
         debugSession,
@@ -561,18 +732,68 @@ export class SnapshotProvider {
         parentSessionType: debugSession.type,
         launchToken: freshLaunchToken,
       });
+      return true;
     } catch (e) {
       this.telemetry.logError(debugSession, e as Error, 'takeSnapshot', 'takeSnapshotError', {
         variant,
         parentSessionType: debugSession.type,
       });
-      void vscode.window.showErrorMessage(`Tintype snapshot failed: ${(e as Error).message}`);
+      if (userInitiated) {
+        void vscode.window.showErrorMessage(`Tintype snapshot failed: ${(e as Error).message}`);
+      } else {
+        // Only the auto path stashes the reason; a manual failure racing
+        // an automatic one must not supply the latch message.
+        this.lastAutoSnapshotError = e as Error;
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Issue the capture itself. When ``timeoutMs`` is set the deadline is
+   * handed to ``tintype.vscode.capture()`` so the debuggee bounds its own
+   * stack walk — truncating the snapshot instead of letting a slow
+   * capture hold up the next step. Capturing without a deadline (the
+   * manual camera button) keeps tintype's own defaults.
+   *
+   * ``timeout`` was added to ``capture()`` after the extension shipped,
+   * so a user whose installed tintype predates it would otherwise see a
+   * ``TypeError`` on every automatic snapshot. Fall back to an uncapped
+   * capture once per session and remember the answer.
+   */
+  private async requestCapture(
+    session: vscode.DebugSession,
+    timeoutMs: number | undefined,
+  ): Promise<void> {
+    const useTimeout = timeoutMs != null && !this.captureTimeoutUnsupported.has(session.id);
+    const evaluate = (expression: string) =>
+      session.customRequest('evaluate', {expression, context: 'repl'});
+    if (!useTimeout) {
+      await evaluate(CAPTURE_CALL);
+      return;
+    }
+
+    // Seconds, matching the tintype Python API.
+    const timeoutSeconds = timeoutMs / 1000;
+    try {
+      await evaluate(`${CAPTURE_WITH_TIMEOUT_PREFIX}${timeoutSeconds})`);
+    } catch (e) {
+      if (!isUnexpectedKeywordArgumentError(e)) {
+        throw e;
+      }
+      this.captureTimeoutUnsupported.add(session.id);
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[tintype] the installed tintype package does not accept a capture timeout; ' +
+          'automatic snapshots will run uncapped. Upgrade tintype to bound them.',
+      );
+      await evaluate(CAPTURE_CALL);
     }
   }
 
   private async initializeSnapshotting(
     session: vscode.DebugSession,
-    triggerVariant: 'takeSnapshot' | 'takeSnapshotOnParent' = 'takeSnapshot',
+    triggerVariant: SnapshotTriggerVariant = 'takeSnapshot',
     launchesViewer = true,
   ): Promise<void> {
     this.initializingSessions.add(session.id);
@@ -613,15 +834,22 @@ export class SnapshotProvider {
           pytbPath: workingFilePath,
           cwd: parentCwd,
         });
-        // Launch the viewer against the working file for callers that
-        // have not opted out. The viewer tolerates a zero-snapshot
-        // ``.pytb`` at launch time and stays in a "waiting" state until
-        // snapshots accrue (either a snappoint hits or the user clicks
-        // the camera button).
+        // Launch the viewer against the working file for user-initiated
+        // captures. The viewer tolerates a zero-snapshot ``.pytb`` at
+        // launch time and stays in a "waiting" state until snapshots
+        // accrue. Callers that need a "first" snapshot — e.g. the manual
+        // camera button — issue an explicit ``evaluate`` of
+        // ``tintype.vscode.capture()`` AFTER this init returns.
         //
         // ``takeSnapshotInternal`` opts out: it launches its own viewer
         // *after* writing the snapshot, so the viewer can open on it
         // (see ``snapshotIndex: -1`` in ``launchSnapshotDebugSession``).
+        // Automatic captures opt out and never launch one at all — a
+        // viewer reports ``stopped`` and the tintype adapter never sends
+        // ``continued``, so once one exists VS Code treats it as
+        // permanently stopped and steals focus onto it whenever the
+        // program under test resumes for a perceptible interval (a
+        // ``time.sleep`` is enough). See :meth:`handleParentStopped`.
         if (launchesViewer) {
           launchToken = await this.launchViewerFor(session, workingFilePath, parentCwd);
         }
@@ -888,6 +1116,10 @@ export class SnapshotProvider {
       this.injectedSessions.delete(session.id);
       this.parentInjectionState.delete(session.id);
       this.liveParents.delete(session.id);
+      this.cancelPendingAutoSnapshot(session);
+      this.autoSnapshotInFlight.delete(session.id);
+      this.autoSnapshotDisabled.delete(session.id);
+      this.captureTimeoutUnsupported.delete(session.id);
 
       // If a parent dies while one of its viewers is still live, flip
       // parentAlive to false so the sidebar decorates the group as
@@ -1414,6 +1646,149 @@ export class SnapshotProvider {
       return;
     }
     void this.refreshSnapshotList(session.id);
+  }
+
+  /**
+   * Capture automatically because the live parent ``session`` just hit a
+   * ``stopped`` event — a breakpoint, an exception, or the end of a
+   * step (DAP reports all of them as ``stopped``, so this single hook
+   * covers "stopped or stepped").
+   *
+   * Opt-in: no-op unless the host supplied a
+   * :type:`AutoSnapshotConfigResolver` and the user enabled the setting.
+   *
+   * Automatic capture is a *recording* activity and never opens UI. In
+   * particular it never launches a viewer debug session: the viewer
+   * reports ``stopped`` and the tintype adapter never sends
+   * ``continued``, so VS Code treats a live viewer as permanently
+   * stopped and moves focus onto it whenever the program under test
+   * resumes for a perceptible interval — stepping over a
+   * ``time.sleep(1)`` is enough to make that visible on every step. The
+   * viewer is opened only by an explicit user action (the camera button
+   * or opening a ``.pytb``), where a focus change is expected.
+   *
+   * The capture runs on the paused thread, so the debuggee cannot
+   * service the next step request until it finishes. Three guards keep
+   * that off the user's critical path:
+   *
+   *   * **Settle delay.** The capture is scheduled ``settleMs`` out and
+   *     cancelled by the next stop or by any resume. While the user is
+   *     stepping, no capture is ever started, so there is nothing for
+   *     their next step to queue behind. This is the guard that actually
+   *     fixes stepping latency; the other two only bound the damage.
+   *   * **Deadline.** ``timeoutMs`` is passed down to
+   *     ``tintype.vscode.capture()``, so the debuggee cancels its own
+   *     stack walk on expiry and returns a truncated snapshot. It covers
+   *     the residual case: stepping resumed just as a capture began. The
+   *     extension cannot cancel an in-flight DAP request, so bounding
+   *     only its own wait would not have stopped the debuggee working.
+   *   * **Overlap.** While a capture is in flight for a session, later
+   *     stops on it are dropped, so a debuggee slower than the settle
+   *     delay can't accumulate queued captures. This also covers the
+   *     first stop of a session, which additionally pays for runtime
+   *     injection and spawning the viewer.
+   *
+   * The returned promise resolves once the scheduled capture completes,
+   * or immediately if it is cancelled or skipped.
+   */
+  public handleParentStopped(session: vscode.DebugSession): Promise<void> {
+    if (this.resolveAutoSnapshotConfig == null || !this.supportsLiveSession(session)) {
+      return Promise.resolve();
+    }
+    if (this.autoSnapshotDisabled.has(session.id)) {
+      return Promise.resolve();
+    }
+    const {enabled, timeoutMs, settleMs} = this.resolveAutoSnapshotConfig(session);
+    // A new stop supersedes whatever the previous one scheduled — this is
+    // what makes held-down stepping produce no captures at all.
+    this.cancelPendingAutoSnapshot(session);
+    if (!enabled) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>(resolve => {
+      const timer = setTimeout(() => {
+        this.pendingAutoSnapshots.delete(session.id);
+        void this.runAutoSnapshot(session, timeoutMs).then(resolve, resolve);
+      }, settleMs);
+      this.pendingAutoSnapshots.set(session.id, {timer, resolve});
+    });
+  }
+
+  /**
+   * Drop a scheduled capture that has not fired yet. Called when the
+   * session resumes — the debuggee is about to be running, and an
+   * ``evaluate`` against a running thread fails rather than capturing.
+   *
+   * Safe to call for sessions with nothing pending.
+   */
+  public cancelPendingAutoSnapshot(session: vscode.DebugSession): void {
+    const pending = this.pendingAutoSnapshots.get(session.id);
+    if (pending == null) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.pendingAutoSnapshots.delete(session.id);
+    pending.resolve();
+  }
+
+  /** Cancel every scheduled capture. Called when the host disposes. */
+  public dispose(): void {
+    for (const sessionId of Array.from(this.pendingAutoSnapshots.keys())) {
+      const pending = this.pendingAutoSnapshots.get(sessionId);
+      if (pending != null) {
+        clearTimeout(pending.timer);
+        pending.resolve();
+      }
+    }
+    this.pendingAutoSnapshots.clear();
+  }
+
+  /**
+   * Run a settled automatic capture, and give up on this session for
+   * good if it fails.
+   *
+   * The latch matters more than it looks. A failing
+   * ``ensureSnapshotting`` leaves ``injectedSessions`` unpopulated and
+   * clears its own in-flight promise, so without this every subsequent
+   * stop would re-run the entire injection sequence — the runtime probe,
+   * several sequential ``evaluate`` round-trips and a ``startDebugging``
+   * — against the paused thread, which is the slowest path in the
+   * feature. The usual cause (tintype missing from the debuggee's
+   * interpreter) cannot resolve itself mid-session, so retrying only
+   * spends the user's stepping latency to fail again.
+   */
+  private async runAutoSnapshot(session: vscode.DebugSession, timeoutMs: number): Promise<void> {
+    if (this.autoSnapshotInFlight.has(session.id) || this.autoSnapshotDisabled.has(session.id)) {
+      return;
+    }
+    this.autoSnapshotInFlight.add(session.id);
+    let captured: boolean;
+    try {
+      captured = await this.takeSnapshotInternal(session, 'autoSnapshot', timeoutMs);
+    } finally {
+      this.autoSnapshotInFlight.delete(session.id);
+    }
+    if (captured) {
+      return;
+    }
+
+    this.autoSnapshotDisabled.add(session.id);
+    const reason = this.lastAutoSnapshotError?.message ?? 'unknown error';
+    this.lastAutoSnapshotError = undefined;
+    this.telemetry.logEvent(session, 'takeSnapshot', {
+      variant: 'autoSnapshot',
+      autoSnapshotDisabled: true,
+      parentSessionType: session.type,
+    });
+    // Exactly one message per session, and only because a feature the
+    // user switched on has just switched itself off. The passive-event
+    // no-toast rule targets routine and repeating notifications; this is
+    // a one-shot terminal state change the user has to act on.
+    void vscode.window.showWarningMessage(
+      `Automatic Tintype snapshots are disabled for this debug session: ${reason}. ` +
+        'Use Take Tintype Snapshot to capture manually.',
+    );
   }
 
   /**
