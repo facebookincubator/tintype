@@ -91,6 +91,23 @@
           "type": "string",
           "default": "",
           "description": "Python interpreter containing a compatible Tintype package. Defaults to the active Python extension environment."
+        },
+        "tintype.autoSnapshotOnStop": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically take a Tintype snapshot every time the debugger stops on a breakpoint, an exception, or after a step."
+        },
+        "tintype.autoSnapshotSettleMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "description": "How long (in milliseconds) the debugger must stay stopped before an automatic snapshot is initiated. Set to 0 to snapshot on every stop, which gives a denser timeline at the cost of slower stepping."
+        },
+        "tintype.autoSnapshotTimeoutMs": {
+          "type": "number",
+          "default": 250,
+          "exclusiveMinimum": 0,
+          "description": "Deadline (in milliseconds) for each automatic snapshot. Tintype stops walking the stack when the deadline passes and keeps the frames it already captured, so a slow snapshot is truncated rather than skipped."
         }
       }
     },

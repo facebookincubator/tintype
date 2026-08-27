@@ -12,7 +12,11 @@ import path from 'path';
 import {promisify} from 'util';
 import * as vscode from 'vscode';
 
-import {registerSnapshotProvider, registerSnappointProvider} from 'tintype-vscode-core';
+import {
+  createAutoSnapshotConfigResolver,
+  registerSnapshotProvider,
+  registerSnappointProvider,
+} from 'tintype-vscode-core';
 import {extractSnappointCapture, rewriteSnappoints} from './snappoints';
 
 const execFileAsync = promisify(execFile);
@@ -38,6 +42,7 @@ export function activate(context: vscode.ExtensionContext): void {
       prepareCaptureRuntime: async (_session, evaluate) => {
         await evaluate("__import__('tintype.vscode', fromlist=['session_info']).session_info()");
       },
+      resolveAutoSnapshotConfig: createAutoSnapshotConfigResolver(COMMAND_PREFIX),
     },
   });
 
