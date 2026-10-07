@@ -157,7 +157,7 @@ function childSessionFromConfig(
     id,
     type: VIEWER_TYPE,
     name: (config.name as string) ?? 'Tintype Snapshot',
-    customRequest: (customRequest ?? fallback) as unknown as vscode.DebugSession['customRequest'],
+    customRequest: customRequest ?? fallback,
     workspaceFolder: undefined,
     configuration: {
       type: VIEWER_TYPE,
@@ -249,7 +249,7 @@ describe('SnapshotProvider', () => {
         id: 's',
         type: 'node',
         name: 'n',
-        customRequest: jest.fn() as unknown as vscode.DebugSession['customRequest'],
+        customRequest: jest.fn(),
         workspaceFolder: undefined,
         configuration: {type: 'node', name: 'n', request: 'launch'},
       };
@@ -1338,7 +1338,7 @@ describe('handleParentStopped', () => {
       });
     return {
       ...healthy,
-      customRequest: customRequest as unknown as vscode.DebugSession['customRequest'],
+      customRequest,
     };
   }
 
@@ -1619,7 +1619,7 @@ describe('handleParentStopped', () => {
       id: 'node-1',
       type: 'node',
       name: 'Node',
-      customRequest: jest.fn() as unknown as vscode.DebugSession['customRequest'],
+      customRequest: jest.fn(),
       workspaceFolder: undefined,
       configuration: {type: 'node', name: 'Node', request: 'launch'},
     };
@@ -1656,7 +1656,7 @@ describe('handleParentStopped', () => {
     return {
       parent: {
         ...createParentSession({id}),
-        customRequest: customRequest as unknown as vscode.DebugSession['customRequest'],
+        customRequest,
       },
       customRequest,
     };
