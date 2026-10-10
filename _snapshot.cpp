@@ -245,7 +245,11 @@ static PyObject* SerializedListObject_repr(PyObject* self) {
 // objects that may appear as dict keys in the object graph, so we restore
 // identity-based hashing.
 static Py_hash_t SerializedCollection_hash(PyObject* self) {
+#if PY_VERSION_HEX >= 0x030D0000 // Python 3.13+
+  return Py_HashPointer(self);
+#else
   return _Py_HashPointer(self);
+#endif
 }
 
 // clang-format off
