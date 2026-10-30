@@ -54,6 +54,7 @@ class ListSubclass(list):  # pyre-ignore[T484]
     """Subclass of list for testing SerializedList."""
 
     def __init__(self, *args: object, extra_attr: str = "default") -> None:
+        # pyrefly: ignore[no-matching-overload]
         super().__init__(*args)
         self.extra_attr = extra_attr
 
@@ -62,6 +63,7 @@ class DictSubclass(dict):  # pyre-ignore[T484]
     """Subclass of dict for testing SerializedDict."""
 
     def __init__(self, *args: object, extra_attr: str = "default") -> None:
+        # pyrefly: ignore[no-matching-overload]
         super().__init__(*args)
         self.extra_attr = extra_attr
 
@@ -70,6 +72,7 @@ class SetSubclass(set):  # pyre-ignore[T484]
     """Subclass of set for testing SerializedSet."""
 
     def __init__(self, *args: object, extra_attr: str = "default") -> None:
+        # pyrefly: ignore[no-matching-overload]
         super().__init__(*args)
         self.extra_attr = extra_attr
 
